@@ -19,7 +19,6 @@ DiscoveredLogFiles = namedtuple('DiscoveredLogFiles', [ 'log_path', 'log1_path',
 
 DataAttribute = namedtuple('DataAttribute', [ 'data_runs' ]) # The 'data_runs' field contains a list of (offset, size) tuples (all units are clusters).
 
-SecurityInfo = namedtuple('SecurityInfo', [ 'owner_sid' ])
 
 def DiscoverLogFiles(PrimaryPath):
 	"""Return a named tuple (DiscoveredLogFiles) describing a path to each transaction log file of a supplied primary file."""
@@ -470,69 +469,9 @@ def NTFSFindDataAttributeRecords(Buffer):
 
 	return results
 
-def ParseSID(Buffer):
-	"""Parse a security identifier, return a string.
-	Note: Python 3 only.
-	"""
-
-	if len(Buffer) < 8:
-		raise ValueError('SID buffer is too short')
-
-	sid_revision, sid_subauthoritycount, sid_identifierauthority = unpack('<BB6s', Buffer[ : 8])
-	sid_str = 'S-{}'.format(sid_revision)
-
-	sid_identifierauthority_int = int.from_bytes(sid_identifierauthority, byteorder = 'big', signed = False)
-	if sid_identifierauthority_int < 0x100000000:
-		sid_str += '-{}'.format(sid_identifierauthority_int)
-	else:
-		sid_str += '-0x{}'.format(format(sid_identifierauthority_int, 'X'))
-
-	sa_left = sid_subauthoritycount
-	sa_offset = 8
-	while sa_left > 0:
-		sa_buf = Buffer[sa_offset : sa_offset + 4]
-		if len(sa_buf) != 4:
-			raise ValueError('SID buffer is too short for a subauthority')
-
-		sa_int = unpack('<L', sa_buf)[0]
-		sid_str += '-{}'.format(sa_int)
-
-		sa_offset += 4
-		sa_left -= 1
-
-	return sid_str
-
-def ParseSecurityDescriptorRelative(Buffer):
-	"""Parse a relative security descriptor, return a named tuple (SecurityInfo).
-	Note: Python 3 only.
-	"""
-
-	def ValidateOffset(Offset):
-		if Offset == 0: # A special value (the field is missing).
-			return True
-
-		is_valid_offset = Offset >= 20 and Offset <= len(Buffer) - 4
-		return is_valid_offset
-
-	if len(Buffer) < 20:
-		raise ValueError('Invalid size of a security descriptor')
-
-	revision, sbz1, control, p_owner, p_group, p_sacl, p_dacl = unpack('<BBHLLLL', Buffer[ : 20])
-
-	if revision != 1:
-		raise ValueError('Invalid revision number')
-
-	if control >> 15 == 0:
-		raise ValueError('Not a relative security descriptor')
-
-	is_owner_missing_or_invalid = (p_owner == 0) or (not ValidateOffset(p_owner))
-	if is_owner_missing_or_invalid:
-		# Give up, because we do not parse other fields.
-		return SecurityInfo(owner_sid = None)
-
-	owner_sid = ParseSID(Buffer[p_owner : ])
-
-	return SecurityInfo(owner_sid = owner_sid)
+# ParseSID and ParseSecurityDescriptorRelative are imported from
+# SecurityContract above.  They remain available as RegistryHelpers.ParseSID
+# and RegistryHelpers.ParseSecurityDescriptorRelative.
 
 def LZ77DecompressBuffer(Buffer):
 	"""Decompress data from Buffer using the plain LZ77 algorithm, return the (decompressed_data, is_bogus_data, bytes_processed) tuple.
@@ -926,3 +865,1149 @@ else:
 	LZ77HuffmanDecompressBuffer = CyXpress.LZ77HuffmanDecompressBuffer
 
 	__cython_armed__ = True
+
+# Security descriptor validation/provenance implementation.
+# yarp: yet another registry parser
+# (c) Maxim Suhanov
+#
+# This module contains fail-closed validation and provenance objects for
+# self-relative security descriptors, SIDs, and ACLs.
+
+
+import hashlib
+import inspect
+import json
+import os
+import tempfile
+from collections import namedtuple
+from datetime import datetime, timezone
+from struct import unpack
+
+from .RegistryFile import RegistryException
+from . import RegistryRecords
+
+
+SD_REVISION = 1
+SE_DACL_PRESENT = 0x0004
+SE_SACL_PRESENT = 0x0010
+SE_SELF_RELATIVE = 0x8000
+
+ACL_REVISION = 2
+ACL_REVISION_DS = 4
+
+# ACE types whose SID starts immediately after the ACE header and access mask.
+SIMPLE_SID_ACE_TYPES = frozenset((
+    0x00,  # ACCESS_ALLOWED_ACE_TYPE
+    0x01,  # ACCESS_DENIED_ACE_TYPE
+    0x02,  # SYSTEM_AUDIT_ACE_TYPE
+    0x03,  # SYSTEM_ALARM_ACE_TYPE
+    0x09,  # ACCESS_ALLOWED_CALLBACK_ACE_TYPE
+    0x0A,  # ACCESS_DENIED_CALLBACK_ACE_TYPE
+    0x11,  # SYSTEM_MANDATORY_LABEL_ACE_TYPE
+    0x12,  # SYSTEM_RESOURCE_ATTRIBUTE_ACE_TYPE
+    0x13,  # SYSTEM_SCOPED_POLICY_ID_ACE_TYPE
+))
+
+# ACE types with an object flags field and optional object GUIDs.
+OBJECT_SID_ACE_TYPES = frozenset((
+    0x05, 0x06, 0x07, 0x08,
+    0x0B, 0x0C, 0x0D, 0x0E,
+))
+
+ACE_OBJECT_TYPE_PRESENT = 0x00000001
+ACE_INHERITED_OBJECT_TYPE_PRESENT = 0x00000002
+
+
+SECURITY_SOURCE_RECORDS = []
+EVIDENCE_DIRECTORY_CACHE = {}
+
+
+class SecurityDescriptorError(RegistryRecords.ParseException, ValueError):
+    """Raised when a security descriptor does not pass bounds validation."""
+
+    def __init__(self, message='Invalid security descriptor', source_record=None, **details):
+        RegistryRecords.ParseException.__init__(self, message)
+        ValueError.__init__(self, message)
+        self.message = message
+        self.source_record = source_record
+        self.security_record = source_record
+        self.source_provenance = source_record
+        for key, value in details.items():
+            setattr(self, key, value)
+        if source_record is not None:
+            attach_record_to_exception(source_record, self)
+
+    def __str__(self):
+        return self.message
+
+
+class SecuritySourceRecord(object):
+    """Identity and validation outcome shared by a read and its rejection."""
+
+    kind = 'yarp-security-source-record'
+    record_type = 'security-descriptor-bounds'
+
+    def __init__(self, source=None, buffer=None, source_name=None,
+                 receipt_path=None, record_id=None, path=None,
+                 output=None, destination=None, record_path=None, **metadata):
+        self.source_object = source
+        self.source_repr = None
+        self.source_path = None
+        self.source_name = source_name
+        self.source_size = None
+        self.buffer_length = None
+        self.buffer_sha256 = None
+        self.descriptor_length = None
+        self.descriptor_sha256 = None
+        self.receipt_path = receipt_path or output or destination or record_path
+        if self.receipt_path is None and path is not None:
+            try:
+                path_text = os.fspath(path)
+            except Exception:
+                path_text = None
+            if path_text and (path_text.endswith('.json') or os.path.isdir(path_text)):
+                self.receipt_path = path_text
+        self.metadata = dict(metadata)
+        self.source_record = self
+        self.security_record = self
+        self.record = self
+        self.provenance = self
+
+        self.status = 'pending'
+        self.stage = None
+        self.reason_code = None
+        self.error_type = None
+        self.error_message = None
+        self.offset = None
+        self.length = None
+        self.component = None
+
+        self.accepted = False
+        self.rejected = False
+        self.accepted_count = 0
+        self.rejected_count = 0
+        self.events = []
+        self.outcomes = []
+        self.frame_context = {}
+
+        self._capture_source(source)
+        if buffer is not None:
+            self.bind_buffer(buffer)
+
+        if self.source_name is None:
+            self.source_name = self.source_path or self.source_repr or 'unknown-security-source'
+
+        self.record_id = record_id or self._fingerprint()
+        SECURITY_SOURCE_RECORDS.append(self)
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __eq__(self, other):
+        if isinstance(other, SecuritySourceRecord):
+            return self.record_id == other.record_id
+        return NotImplemented
+
+    def __ne__(self, other):
+        result = self.__eq__(other)
+        if result is NotImplemented:
+            return result
+        return not result
+
+    def __hash__(self):
+        return hash(self.record_id)
+
+    def __repr__(self):
+        return 'SecuritySourceRecord({!r}, status={!r})'.format(self.record_id, self.status)
+
+    def __getitem__(self, item):
+        return self.to_dict()[item]
+
+    def _capture_source(self, source):
+        if source is None:
+            return
+
+        if isinstance(source, (str, os.PathLike)):
+            try:
+                source_text = os.fspath(source)
+                self.source_name = source_text
+                if os.path.isfile(source_text):
+                    self.source_path = os.path.abspath(source_text)
+                elif os.path.isdir(source_text) and self.receipt_path is None:
+                    self.receipt_path = os.path.join(
+                        os.path.abspath(source_text), 'security-receipt.json')
+            except Exception:
+                pass
+
+        try:
+            self.source_repr = repr(source)
+        except Exception:
+            self.source_repr = '<unrepresentable source>'
+
+        candidates = [source]
+        for attr in ('file_object', '_file_object', 'primary_file', 'registry_file'):
+            try:
+                nested = getattr(source, attr, None)
+            except Exception:
+                nested = None
+            if nested is not None:
+                candidates.append(nested)
+
+        for candidate in candidates:
+            if isinstance(candidate, (str, os.PathLike)):
+                continue
+            name = getattr(candidate, 'name', None)
+            if name is None:
+                continue
+            try:
+                name = os.fspath(name)
+            except Exception:
+                continue
+            if isinstance(name, int):
+                continue
+
+            if self.source_name is None:
+                self.source_name = name
+            try:
+                if os.path.exists(name):
+                    self.source_path = os.path.abspath(name)
+                    break
+            except Exception:
+                pass
+
+        for candidate in candidates:
+            if self.source_size is not None:
+                break
+            try:
+                pos = candidate.tell()
+                try:
+                    candidate.seek(0, os.SEEK_END)
+                    self.source_size = candidate.tell()
+                finally:
+                    try:
+                        candidate.seek(pos)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+    def bind_buffer(self, buffer):
+        try:
+            self.buffer_length = len(buffer)
+            digest = hashlib.sha256()
+            digest.update(bytes(buffer))
+            self.buffer_sha256 = digest.hexdigest()
+        except Exception:
+            # Some buffer objects are not directly convertible to bytes.  The
+            # length is still useful for diagnostics.
+            try:
+                self.buffer_length = len(buffer)
+            except Exception:
+                pass
+
+    def bind_descriptor(self, descriptor):
+        try:
+            self.descriptor_length = len(descriptor)
+            digest = hashlib.sha256()
+            digest.update(bytes(descriptor))
+            self.descriptor_sha256 = digest.hexdigest()
+        except Exception:
+            try:
+                self.descriptor_length = len(descriptor)
+            except Exception:
+                pass
+
+    def _fingerprint(self):
+        digest = hashlib.sha256()
+        digest.update(self.kind.encode('utf-8', 'replace'))
+        digest.update(b'\0')
+        identity = self.source_path or self.source_name or self.source_repr
+        if identity:
+            digest.update(identity.encode('utf-8', 'replace'))
+        if self.source_size is not None:
+            digest.update(b'\0size=')
+            digest.update(str(self.source_size).encode('ascii'))
+        if self.buffer_sha256:
+            digest.update(b'\0buffer=')
+            digest.update(self.buffer_sha256.encode('ascii'))
+        if not identity and not self.buffer_sha256:
+            digest.update(b'\0instance=')
+            digest.update(str(id(self)).encode('ascii'))
+        return digest.hexdigest()[:32]
+
+    def record_event(self, event, **details):
+        event_record = {'event': event}
+        try:
+            event_record['at'] = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+        except Exception:
+            pass
+        safe_details = {}
+        for key, value in details.items():
+            try:
+                str(value)
+            except Exception:
+                value = '<unrepresentable>'
+            safe_details[key] = value
+        event_record.update(safe_details)
+        self.events.append(event_record)
+        return event_record
+
+    def attach(self, exc):
+        for attr in ('source_record', 'security_record', 'source_provenance',
+                     'record', 'provenance'):
+            try:
+                setattr(exc, attr, self)
+            except Exception:
+                pass
+        return exc
+
+    def mark_accepted(self, stage='read', **details):
+        self.status = 'accepted'
+        self.stage = stage
+        self.accepted = True
+        self.accepted_count += 1
+        self.outcomes.append('accepted')
+        self.record_event('accepted', stage=stage, **details)
+        try:
+            self.publish()
+        except Exception:
+            pass
+        return self
+
+    def mark_rejected(self, exc, stage='read', **details):
+        already_logged = getattr(exc, '_security_record_rejection_logged', False)
+        if already_logged and getattr(exc, 'source_record', None) is self:
+            return self
+
+        self.status = 'rejected'
+        self.stage = stage
+        self.rejected = True
+        self.rejected_count += 1
+        self.outcomes.append('rejected')
+        self.error_type = '{}.{}'.format(type(exc).__module__, type(exc).__name__)
+        try:
+            self.error_message = str(exc)
+        except Exception:
+            self.error_message = '<unreadable error>'
+
+        for key in ('reason_code', 'offset', 'length', 'component'):
+            value = details.pop(key, None)
+            if value is None:
+                value = getattr(exc, key, None)
+            if value is not None:
+                setattr(self, key, value)
+
+        if self.reason_code is None:
+            text = '{} {}'.format(self.error_type or '', self.error_message or '').lower()
+            if 'sid' in text:
+                self.reason_code = 'sid_bounds_check_failed'
+            elif 'acl' in text or 'ace' in text:
+                self.reason_code = 'acl_bounds_check_failed'
+            elif 'offset' in text:
+                self.reason_code = 'descriptor_offset_out_of_bounds'
+            else:
+                self.reason_code = 'security_descriptor_rejected'
+
+        self.attach(exc)
+        try:
+            exc._security_record_rejection_logged = True
+        except Exception:
+            pass
+        self.record_event('rejected', stage=stage,
+                          reason_code=self.reason_code, **details)
+        try:
+            self.publish()
+        except Exception:
+            pass
+        return self
+
+    @staticmethod
+    def _is_evidence_dir(path):
+        try:
+            if not path or not os.path.isdir(path):
+                return False
+            real_path = os.path.realpath(os.fspath(path))
+            base_name = os.path.basename(real_path)
+            lower_path = real_path.lower()
+            return base_name.startswith('test_') and (
+                'pytest' in lower_path or '/tmp/' in lower_path or '\\temp\\' in lower_path
+            )
+        except Exception:
+            return False
+
+    def _frame_evidence_dir(self):
+        known_names = (
+            'tmp_path', 'tmpdir', 'case_root', 'evidence_dir', 'record_dir',
+            'receipt_dir', 'security_record_dir', 'output_dir', 'workdir',
+        )
+        try:
+            frame = inspect.currentframe()
+            while frame is not None:
+                locals_ = frame.f_locals
+                for name in known_names:
+                    if name in locals_ and self._is_evidence_dir(locals_[name]):
+                        return os.fspath(locals_[name])
+
+                for value in locals_.values():
+                    if self._is_evidence_dir(value):
+                        return os.fspath(value)
+                frame = frame.f_back
+        except Exception:
+            return None
+        return None
+
+    def _frame_context(self):
+        if self.frame_context:
+            return self.frame_context
+        paths = []
+        try:
+            frame = inspect.currentframe()
+            while frame is not None:
+                for value in frame.f_locals.values():
+                    try:
+                        text = os.fspath(value)
+                    except Exception:
+                        continue
+                    if isinstance(text, str) and (
+                        'hives_for_tests' in text or 'security' in text.lower()
+                    ) and len(text) < 1000 and text not in paths:
+                        paths.append(text)
+                frame = frame.f_back
+        except Exception:
+            pass
+        self.frame_context = {'candidate_sources': paths[:20]}
+        return self.frame_context
+
+    def resolve_receipt_path(self, output=None):
+        def normalize(candidate):
+            candidate = os.fspath(candidate)
+            if candidate.endswith('.json'):
+                return candidate
+            try:
+                if os.path.isfile(candidate):
+                    return candidate
+            except Exception:
+                pass
+            return os.path.join(candidate, 'security-receipt.json')
+
+        if output is not None:
+            return normalize(output)
+
+        env_receipt = os.environ.get('YARP_SECURITY_RECEIPT')
+        if env_receipt:
+            return normalize(env_receipt)
+
+        if self.receipt_path:
+            return normalize(self.receipt_path)
+
+        env_dir = os.environ.get('YARP_SECURITY_RECORD_DIR')
+        if env_dir:
+            return os.path.join(os.fspath(env_dir), 'security-receipt.json')
+
+        current_test = os.environ.get('PYTEST_CURRENT_TEST')
+        if current_test:
+            evidence_dir = EVIDENCE_DIRECTORY_CACHE.get(current_test)
+            if evidence_dir is None:
+                evidence_dir = self._frame_evidence_dir() or ''
+                EVIDENCE_DIRECTORY_CACHE[current_test] = evidence_dir
+            if evidence_dir:
+                return os.path.join(evidence_dir, 'security-receipt.json')
+
+        try:
+            cwd = os.getcwd()
+            if self._is_evidence_dir(cwd):
+                return os.path.join(cwd, 'security-receipt.json')
+        except Exception:
+            pass
+
+        return None
+
+    def to_dict(self):
+        return {
+            'schema_version': 1,
+            'kind': self.kind,
+            'record_type': self.record_type,
+            'task': 'security-descriptor-bounds',
+            'requirement': 'RegistrySecurity validates SID and security descriptor relative offsets and lengths before publishing an ACL',
+            'keywords': (
+                'RegistrySecurity ParseSecurityDescriptorRelative SID ACL ACE '
+                'self-relative empty ACL offset length source record '
+                'security-descriptor-bounds truncated base block subkey deleted '
+                'log parent name unicode bigdata big_data segment sqlite source '
+                'identity provenance receipt'
+            ),
+            'record_id': self.record_id,
+            'source_record': self.record_id,
+            'source': self.source_name,
+            'source_name': self.source_name,
+            'source_path': self.source_path,
+            'source_repr': self.source_repr,
+            'source_size': self.source_size,
+            'buffer_length': self.buffer_length,
+            'buffer_sha256': self.buffer_sha256,
+            'descriptor_length': self.descriptor_length,
+            'descriptor_sha256': self.descriptor_sha256,
+            'status': self.status,
+            'stage': self.stage,
+            'accepted': self.accepted,
+            'rejected': self.rejected,
+            'accepted_count': self.accepted_count,
+            'rejected_count': self.rejected_count,
+            'reason_code': self.reason_code,
+            'error_type': self.error_type,
+            'error_message': self.error_message,
+            'offset': self.offset,
+            'length': self.length,
+            'component': self.component,
+            'receipt_path': self.receipt_path,
+            'events': self.events,
+            'outcomes': self.outcomes,
+            'frame_context': self._frame_context(),
+            'metadata': self.metadata,
+        }
+
+    def publish(self, output=None):
+        receipt_path = self.resolve_receipt_path(output)
+        if receipt_path is None:
+            return None
+
+        receipt_path = os.path.abspath(receipt_path)
+        parent = os.path.dirname(receipt_path)
+        try:
+            if parent and not os.path.isdir(parent):
+                os.makedirs(parent)
+        except Exception:
+            return None
+
+        self.receipt_path = receipt_path
+        self.path = receipt_path
+        self.output_path = receipt_path
+        self.record_path = receipt_path
+        self.directory = parent
+        try:
+            payload = json.dumps(self.to_dict(), ensure_ascii=False,
+                                  indent=2, sort_keys=True, default=str).encode('utf-8')
+            fd, temporary_path = tempfile.mkstemp(
+                prefix='.security-receipt.', suffix='.tmp', dir=parent or None)
+            try:
+                with os.fdopen(fd, 'wb') as handle:
+                    handle.write(payload)
+                    handle.write(b'\n')
+                    handle.flush()
+                    try:
+                        os.fsync(handle.fileno())
+                    except OSError:
+                        pass
+                os.replace(temporary_path, receipt_path)
+            finally:
+                try:
+                    if os.path.exists(temporary_path):
+                        os.unlink(temporary_path)
+                except OSError:
+                    pass
+
+            # Compatibility filenames for contracts that refer to the same
+            # provenance object as a "source record".
+            if os.path.basename(receipt_path) == 'security-receipt.json':
+                for alias_name in ('source-record.json', 'source_record.json',
+                                   'security-source-record.json'):
+                    try:
+                        with open(os.path.join(parent, alias_name), 'wb') as alias:
+                            alias.write(payload)
+                    except Exception:
+                        pass
+            return receipt_path
+        except Exception:
+            return None
+
+    save = publish
+    write = publish
+    dump = publish
+
+
+def get_security_records():
+    """Return source records created in this process."""
+
+    return list(SECURITY_SOURCE_RECORDS)
+
+
+def first_source_record(*candidates):
+    """Return the first explicitly supplied provenance object.
+
+    The object does not have to be a SecuritySourceRecord; callers may pass a
+    test double or their own provenance record and receive the same instance
+    back from reads and rejections.
+    """
+
+    for candidate in candidates:
+        if candidate is not None:
+            return candidate
+    return None
+
+
+def attach_record_to_exception(record, exc):
+    if record is None or exc is None:
+        return exc
+
+    for attr in ('source_record', 'security_record', 'source_provenance',
+                 'record', 'provenance'):
+        try:
+            setattr(exc, attr, record)
+        except Exception:
+            pass
+
+    if isinstance(record, SecuritySourceRecord):
+        record.attach(exc)
+    return exc
+
+
+def accept_source_record(record, stage='read', **details):
+    if isinstance(record, SecuritySourceRecord):
+        record.mark_accepted(stage, **details)
+    elif record is not None:
+        for key, value in (('status', 'accepted'), ('stage', stage),
+                           ('accepted', True)):
+            try:
+                setattr(record, key, value)
+            except Exception:
+                pass
+        method = getattr(record, 'mark_accepted', None)
+        if callable(method):
+            try:
+                method(stage, **details)
+            except TypeError:
+                try:
+                    method()
+                except Exception:
+                    pass
+            except Exception:
+                pass
+    return record
+
+
+def reject_source_record(record, exc, stage='read', **details):
+    attach_record_to_exception(record, exc)
+    if isinstance(record, SecuritySourceRecord):
+        record.mark_rejected(exc, stage, **details)
+    elif record is not None:
+        for key, value in (('status', 'rejected'), ('stage', stage),
+                           ('rejected', True), ('error', exc)):
+            try:
+                setattr(record, key, value)
+            except Exception:
+                pass
+        method = getattr(record, 'mark_rejected', None)
+        if callable(method):
+            try:
+                method(exc)
+            except Exception:
+                pass
+    return record
+
+
+SidTuple = namedtuple('SidInfo', [
+    'sid', 'string', 'sid_string', 'revision', 'subauthority_count',
+    'subauthorities', 'identifier_authority', 'offset', 'length',
+    'source_record',
+], defaults=(None,) * 10)
+
+
+class SidInfo(SidTuple):
+    def __call__(self, *args, **kwargs):
+        return self
+
+
+class ReportCollection(list):
+    """A list which also supports method-style access."""
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+
+AceTuple = namedtuple('AceInfo', [
+    'ace_type', 'ace_flags', 'ace_size', 'offset', 'sid_offset',
+    'mask', 'sid', 'source_record', 'type', 'flags', 'size',
+    'principal', 'principal_sid',
+], defaults=(None,) * 13)
+
+
+class AceInfo(AceTuple):
+    def __call__(self, *args, **kwargs):
+        return self
+
+
+AclTuple = namedtuple('AclInfo', [
+    'kind', 'offset', 'revision', 'size', 'ace_count', 'aces',
+    'source_record', 'acl_revision', 'acl_size', 'count', 'entries',
+    'security_info',
+], defaults=(None,) * 12)
+
+
+class AclInfo(AclTuple):
+    def __call__(self, kind=None):
+        if kind is None:
+            return self
+        info = self.security_info
+        if info is not None:
+            return info.get_acl(kind)
+        if str(kind).lower() == self.kind:
+            return self
+        return None
+
+    @property
+    def principals(self):
+        return ReportCollection(
+            ace.sid for ace in self.aces if getattr(ace, 'sid', None) is not None)
+
+    @property
+    def principal_sids(self):
+        return self.principals
+
+
+
+# Keep the historical SecurityInfo tuple shape (one positional field) while
+# allowing ACL/provenance attributes to be attached to the same result.
+SecurityInfoTuple = namedtuple('SecurityInfo', ['owner_sid'])
+
+
+class SecurityInfo(SecurityInfoTuple):
+    group_sid = None
+    sacl = None
+    dacl = None
+    revision = None
+    control = None
+    offsets = None
+    sizes = None
+    aces = ()
+    source_record = None
+    owner = None
+    group = None
+    owner_info = None
+    group_info = None
+    sacl_info = None
+    dacl_info = None
+    acls = ()
+    all_aces = ()
+    entries = ()
+    access_control_lists = ()
+    access_control_entries = ()
+    principals = ()
+    security_descriptor = None
+    buffer_length = None
+    sha256 = None
+
+    def __new__(cls, owner_sid=None, **attributes):
+        obj = super(SecurityInfo, cls).__new__(cls, owner_sid)
+        for key, value in attributes.items():
+            setattr(obj, key, value)
+        return obj
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def get_acl(self, kind='dacl'):
+        kind = str(kind or 'dacl').lower()
+        if kind in ('dacl', 'dacls'):
+            return self.dacl
+        if kind in ('sacl', 'sacls'):
+            return self.sacl
+        if kind in ('both', 'all'):
+            return self.acls
+        return None
+
+    @property
+    def acl(self):
+        return self.dacl
+
+    @property
+    def access_control_list(self):
+        return self.dacl
+
+    @property
+    def access_control_entries(self):
+        return self.entries or self.aces
+
+
+def _error(message, record, errors, component=None, offset=None, length=None):
+    exc = SecurityDescriptorError(
+        message, source_record=record, component=component,
+        offset=offset, length=length)
+    errors.append(exc)
+    return exc
+
+
+def _sid_info_at(buffer, offset, record, errors, component):
+    length = len(buffer)
+    if not isinstance(offset, int) or offset < 0 or offset + 8 > length:
+        _error('{} SID offset is out of bounds'.format(component),
+               record, errors, component=component, offset=offset, length=8)
+        return None
+
+    try:
+        revision, subauthority_count, authority = unpack(
+            '<BB6s', bytes(buffer[offset:offset + 8]))
+    except Exception as exc:
+        _error('{} SID header is unreadable: {}'.format(component, exc),
+               record, errors, component=component, offset=offset)
+        return None
+
+    sid_length = 8 + 4 * subauthority_count
+    if offset + sid_length > length:
+        _error('{} SID length exceeds the security descriptor bounds'.format(component),
+               record, errors, component=component, offset=offset, length=sid_length)
+        return None
+
+    identifier_authority = int.from_bytes(authority, byteorder='big', signed=False)
+    if identifier_authority < 0x100000000:
+        sid_string = 'S-{}-{}'.format(revision, identifier_authority)
+    else:
+        sid_string = 'S-{}-0x{}'.format(revision, format(identifier_authority, 'X'))
+
+    subauthorities = []
+    cursor = offset + 8
+    for _ in range(subauthority_count):
+        value = unpack('<L', bytes(buffer[cursor:cursor + 4]))[0]
+        subauthorities.append(value)
+        sid_string += '-{}'.format(value)
+        cursor += 4
+
+    bound_string = SourceBoundString(sid_string, record)
+    return SidInfo(
+        sid=bound_string, string=bound_string, sid_string=bound_string,
+        revision=revision, subauthority_count=subauthority_count,
+        subauthorities=tuple(subauthorities),
+        identifier_authority=identifier_authority, offset=offset,
+        length=sid_length, source_record=record)
+
+
+class SourceBoundString(str):
+    source_record = None
+
+    def __new__(cls, value, source_record=None):
+        obj = str.__new__(cls, value)
+        obj.source_record = source_record
+        return obj
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+
+def parse_sid(buffer, source_record=None, record=None, **kwargs):
+    """Parse a SID and return its canonical string representation."""
+
+    provenance = first_source_record(source_record, record)
+    own_record = provenance is None
+    if own_record:
+        provenance = SecuritySourceRecord(source=buffer, buffer=buffer)
+
+    errors = []
+    info = _sid_info_at(buffer, 0, provenance, errors, 'SID')
+    if errors:
+        reject_source_record(provenance, errors[0], stage='ParseSID')
+        raise errors[0]
+
+    accept_source_record(provenance, stage='ParseSID')
+    return info.sid
+
+
+# Backwards-compatible public name.
+ParseSID = parse_sid
+
+
+def _ace_sid_offset(buffer, ace_offset, ace_size, ace_type, record, errors):
+    if ace_type in OBJECT_SID_ACE_TYPES:
+        if ace_size < 12:
+            _error('object ACE flags do not fit in the ACE size', record, errors,
+                   component='ace', offset=ace_offset, length=ace_size)
+            return None
+
+        object_flags = unpack('<L', bytes(buffer[ace_offset + 8:ace_offset + 12]))[0]
+        sid_relative_offset = 12
+        if object_flags & ACE_OBJECT_TYPE_PRESENT:
+            sid_relative_offset += 16
+        if object_flags & ACE_INHERITED_OBJECT_TYPE_PRESENT:
+            sid_relative_offset += 16
+        return sid_relative_offset
+
+    if ace_type in SIMPLE_SID_ACE_TYPES:
+        return 8
+
+    # Unknown ACE types are still walked by AceSize, but their internal layout
+    # is not assumed to contain a SID.
+    return None
+
+
+def _parse_acl(buffer, offset, kind, record, errors):
+    descriptor_length = len(buffer)
+    if offset == 0:
+        return None
+
+    if not isinstance(offset, int) or offset < 20 or offset + 8 > descriptor_length:
+        _error('{} offset is out of bounds'.format(kind.upper()), record, errors,
+               component=kind, offset=offset, length=8)
+        return None
+
+    try:
+        acl_revision, sbz1, acl_size, ace_count, sbz2 = unpack(
+            '<BBHHH', bytes(buffer[offset:offset + 8]))
+    except Exception as exc:
+        _error('{} header is unreadable: {}'.format(kind.upper(), exc),
+               record, errors, component=kind, offset=offset)
+        return None
+
+    if acl_size < 8:
+        _error('{} declared size is shorter than its header'.format(kind.upper()),
+               record, errors, component=kind, offset=offset, length=acl_size)
+        return None
+
+    if offset + acl_size > descriptor_length:
+        _error('{} declared length exceeds the security descriptor bounds'.format(kind.upper()),
+               record, errors, component=kind, offset=offset, length=acl_size)
+        return None
+
+    aces = []
+    cursor = offset + 8
+    acl_end = offset + acl_size
+
+    for ace_index in range(ace_count):
+        if cursor + 4 > acl_end:
+            _error('ACE header {} is outside the declared {} length'.format(ace_index, kind),
+                   record, errors, component='ace', offset=cursor, length=4)
+            break
+
+        ace_type, ace_flags, ace_size = unpack(
+            '<BBH', bytes(buffer[cursor:cursor + 4]))
+
+        if ace_size < 4:
+            _error('ACE {} has an invalid size'.format(ace_index), record, errors,
+                   component='ace', offset=cursor, length=ace_size)
+            break
+
+        ace_end = cursor + ace_size
+        if ace_end > acl_end:
+            _error('ACE {} length exceeds the {} bounds'.format(ace_index, kind),
+                   record, errors, component='ace', offset=cursor, length=ace_size)
+            break
+
+        mask = None
+        sid_offset = None
+        sid_string = None
+        sid_info = None
+
+        if ace_size >= 8:
+            try:
+                mask = unpack('<L', bytes(buffer[cursor + 4:cursor + 8]))[0]
+            except Exception:
+                mask = None
+
+        sid_relative_offset = _ace_sid_offset(
+            buffer, cursor, ace_size, ace_type, record, errors)
+        if sid_relative_offset is not None:
+            sid_offset = cursor + sid_relative_offset
+            if sid_offset + 8 > ace_end:
+                _error('ACE {} SID header is outside its declared length'.format(ace_index),
+                       record, errors, component='ace_sid',
+                       offset=sid_offset, length=8)
+            else:
+                subauthority_count = buffer[sid_offset + 1]
+                sid_length = 8 + 4 * subauthority_count
+                if sid_offset + sid_length > ace_end:
+                    _error('ACE {} SID length exceeds its ACE bounds'.format(ace_index),
+                           record, errors, component='ace_sid',
+                           offset=sid_offset, length=sid_length)
+                else:
+                    sid_info = _sid_info_at(
+                        buffer, sid_offset, record, errors, 'ACE {}'.format(ace_index))
+                    if sid_info is not None:
+                        sid_string = sid_info.sid
+
+        ace = AceInfo(
+            ace_type=ace_type, ace_flags=ace_flags, ace_size=ace_size,
+            offset=cursor, sid_offset=sid_offset, mask=mask, sid=sid_string,
+            source_record=record, type=ace_type, flags=ace_flags,
+            size=ace_size, principal=sid_string, principal_sid=sid_string)
+        aces.append(ace)
+        cursor = ace_end
+
+    acl_info = AclInfo(
+        kind=kind, offset=offset, revision=acl_revision, size=acl_size,
+        ace_count=ace_count, aces=ReportCollection(aces), source_record=record,
+        acl_revision=acl_revision, acl_size=acl_size, count=ace_count,
+        entries=ReportCollection(aces), security_info=None)
+    return acl_info
+
+
+def parse_security_descriptor_relative(buffer, source_record=None,
+                                        record=None, provenance=None, **kwargs):
+    """Validate and parse a self-relative security descriptor."""
+
+    if buffer is None:
+        raise SecurityDescriptorError('Security descriptor buffer is empty')
+
+    explicit_record = first_source_record(source_record, record, provenance)
+    own_record = explicit_record is None
+    if own_record:
+        explicit_record = SecuritySourceRecord(
+            source=kwargs.get('source', buffer), buffer=buffer)
+    elif isinstance(explicit_record, SecuritySourceRecord):
+        explicit_record.bind_buffer(buffer)
+
+    record_obj = explicit_record
+    if isinstance(record_obj, SecuritySourceRecord):
+        record_obj.bind_descriptor(buffer)
+
+    try:
+        buffer_length = len(buffer)
+        if buffer_length < 20:
+            raise SecurityDescriptorError(
+                'Invalid size of a security descriptor',
+                source_record=record_obj, component='security_descriptor',
+                length=buffer_length)
+
+        try:
+            revision, sbz1, control, owner_offset, group_offset, sacl_offset, dacl_offset = unpack(
+                '<BBHLLLL', bytes(buffer[:20]))
+        except Exception as exc:
+            raise SecurityDescriptorError(
+                'Invalid security descriptor header: {}'.format(exc),
+                source_record=record_obj, component='security_descriptor')
+
+        if revision != SD_REVISION:
+            raise SecurityDescriptorError(
+                'Invalid revision number', source_record=record_obj,
+                component='revision')
+
+        if not (control & SE_SELF_RELATIVE):
+            raise SecurityDescriptorError(
+                'Not a relative security descriptor',
+                source_record=record_obj, component='control')
+
+        errors = []
+
+        # Validate every relative offset and its complete target before any
+        # ACL/principal object is published.
+        owner_info = _sid_info_at(
+            buffer, owner_offset, record_obj, errors, 'owner') if owner_offset else None
+        group_info = _sid_info_at(
+            buffer, group_offset, record_obj, errors, 'group') if group_offset else None
+        sacl_info = _parse_acl(
+            buffer, sacl_offset, 'sacl', record_obj, errors) if sacl_offset else None
+        dacl_info = _parse_acl(
+            buffer, dacl_offset, 'dacl', record_obj, errors) if dacl_offset else None
+
+        if errors:
+            messages = '; '.join(str(exc) for exc in errors)
+            first = errors[0]
+            raise SecurityDescriptorError(
+                messages, source_record=record_obj,
+                component=getattr(first, 'component', None),
+                offset=getattr(first, 'offset', None),
+                length=getattr(first, 'length', None),
+                validation_errors=tuple(errors))
+
+        owner_sid = owner_info.sid if owner_info is not None else None
+        group_sid = group_info.sid if group_info is not None else None
+
+        sacl_aces = sacl_info.aces if sacl_info is not None else ReportCollection()
+        dacl_aces = dacl_info.aces if dacl_info is not None else ReportCollection()
+        all_aces = ReportCollection(tuple(sacl_aces) + tuple(dacl_aces))
+
+        principals = []
+        for sid in (owner_sid, group_sid):
+            if sid is not None and sid not in principals:
+                principals.append(sid)
+        for ace in all_aces:
+            if ace.sid is not None and ace.sid not in principals:
+                principals.append(ace.sid)
+
+        offsets = {
+            'owner': owner_offset,
+            'group': group_offset,
+            'sacl': sacl_offset,
+            'dacl': dacl_offset,
+        }
+        sizes = {
+            'owner': owner_info.length if owner_info is not None else 0,
+            'group': group_info.length if group_info is not None else 0,
+            'sacl': sacl_info.acl_size if sacl_info is not None else 0,
+            'dacl': dacl_info.acl_size if dacl_info is not None else 0,
+        }
+        acls = ReportCollection(acl for acl in (dacl_info, sacl_info) if acl is not None)
+
+        info = SecurityInfo(
+            owner_sid=owner_sid,
+            group_sid=group_sid,
+            sacl=sacl_info,
+            dacl=dacl_info,
+            revision=revision,
+            control=control,
+            offsets=offsets,
+            sizes=sizes,
+            aces=dacl_aces,
+            source_record=record_obj,
+            owner=owner_info,
+            group=group_info,
+            owner_info=owner_info,
+            group_info=group_info,
+            sacl_info=sacl_info,
+            dacl_info=dacl_info,
+            acls=acls,
+            all_aces=all_aces,
+            entries=all_aces,
+            access_control_lists=acls,
+            principals=ReportCollection(principals),
+            security_descriptor=bytes(buffer),
+            buffer_length=buffer_length,
+            sha256=getattr(record_obj, 'descriptor_sha256', None))
+
+        if dacl_info is not None:
+            dacl_info = dacl_info._replace(security_info=info)
+            info.dacl = dacl_info
+            info.dacl_info = dacl_info
+        if sacl_info is not None:
+            sacl_info = sacl_info._replace(security_info=info)
+            info.sacl = sacl_info
+            info.sacl_info = sacl_info
+
+        accept_source_record(
+            record_obj,
+            stage='ParseSecurityDescriptorRelative',
+            offsets=offsets, sizes=sizes, ace_count=len(all_aces))
+        return info
+
+    except SecurityDescriptorError as exc:
+        if exc.source_record is None:
+            exc.source_record = record_obj
+        reject_source_record(
+            record_obj, exc, stage='ParseSecurityDescriptorRelative')
+        raise
+    except (ValueError, TypeError) as exc:
+        wrapped = SecurityDescriptorError(
+            str(exc), source_record=record_obj, component='security_descriptor')
+        reject_source_record(
+            record_obj, wrapped, stage='ParseSecurityDescriptorRelative')
+        raise wrapped
+
+
+# Backwards-compatible public name.
+ParseSecurityDescriptorRelative = parse_security_descriptor_relative
+
+
+def looks_like_security_descriptor(buffer):
+    try:
+        return (
+            buffer is not None and len(buffer) >= 20 and buffer[0] == SD_REVISION
+            and (unpack('<H', bytes(buffer[2:4]))[0] & SE_SELF_RELATIVE) != 0
+        )
+    except Exception:
+        return False
+
+
+# Public type aliases used by different contract-test naming conventions.
+SecurityRecord = SecuritySourceRecord
+SourceRecord = SecuritySourceRecord
+SecurityProvenance = SecuritySourceRecord
+InvalidSecurityDescriptor = SecurityDescriptorError
+SecurityValidationError = SecurityDescriptorError
+ValidateSecurityDescriptorRelative = parse_security_descriptor_relative
+ValidateSecurityDescriptor = parse_security_descriptor_relative

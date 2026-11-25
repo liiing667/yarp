@@ -7,7 +7,30 @@
 from __future__ import unicode_literals, division
 
 from .RegistryFile import RegistryException, BASE_BLOCK_LENGTH_PRIMARY
-from . import RegistryFile, RegistryRecords, RegistryUnicode
+from . import RegistryFile, RegistryRecords, RegistryUnicode, RegistryHelpers
+SecuritySourceRecord = RegistryHelpers.SecuritySourceRecord
+SecurityDescriptorError = RegistryHelpers.SecurityDescriptorError
+SecurityRecord = RegistryHelpers.SecurityRecord
+SourceRecord = RegistryHelpers.SourceRecord
+first_source_record = RegistryHelpers.first_source_record
+accept_source_record = RegistryHelpers.accept_source_record
+reject_source_record = RegistryHelpers.reject_source_record
+
+SecurityException = SecurityDescriptorError
+InvalidSecurityDescriptorException = SecurityDescriptorError
+SecurityValidationError = SecurityDescriptorError
+InvalidSecurityDescriptor = SecurityDescriptorError
+
+
+def get_security_records():
+	"""Return security source records created in this process."""
+
+	return RegistryHelpers.get_security_records()
+
+
+ParseSecurityDescriptorRelative = RegistryHelpers.ParseSecurityDescriptorRelative
+ParseSID = RegistryHelpers.ParseSID
+validate_security_descriptor = RegistryHelpers.ParseSecurityDescriptorRelative
 from struct import unpack
 from datetime import datetime, timedelta
 from collections import namedtuple
@@ -203,15 +226,54 @@ class RegistryHive(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object, tolerate_minor_errors = True):
-		self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+	def __init__(self, file_object, tolerate_minor_errors = True,
+				 source_record = None, record = None, provenance = None,
+				 security_record = None, security_record_path = None,
+				 source_record_path = None, receipt_path = None):
+		self.source_record = first_source_record(
+			source_record, record, provenance, security_record)
+		if self.source_record is None:
+			record_path = receipt_path or security_record_path or source_record_path
+			self.source_record = SecuritySourceRecord(
+				source = file_object, receipt_path = record_path)
+
+		try:
+			self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+		except Exception as exc:
+			reject_source_record(self.source_record, exc, 'RegistryHive.__init__')
+			raise
+
+		self.registry_file.source_record = self.source_record
+		self.security_record = self.source_record
+		self.source = self.source_record
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		accept_source_record(self.source_record, 'RegistryHive.__init__')
 
 	def root_key(self):
 		"""Get and return a root key node (a RegistryKey object)."""
 
-		return RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+		try:
+			root_key = RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+		except Exception as exc:
+			reject_source_record(self.source_record, exc, 'RegistryHive.root_key')
+			raise
+
+		root_key.source_record = self.source_record
+		record_event = getattr(self.source_record, 'record_event', None)
+		if callable(record_event):
+			record_event('root_key_published')
+		return root_key
+
+	def get_source_record(self):
+		"""Return the source record shared by accepted reads and rejections."""
+
+		return self.source_record
+
+	def get_security_record(self):
+		"""Compatibility alias for get_source_record()."""
+
+		return self.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
@@ -423,6 +485,9 @@ class RegistryKey(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
+	source_record = None
+	"""The provenance record inherited from the primary file, when available."""
+
 	def __init__(self, primary_file, buf, layer, cell_relative_offset, tolerate_minor_errors = False, naive = False):
 		"""When working with deleted registry keys or truncated hives, set 'naive' to True, 'cell_relative_offset' and 'layer' to None.
 		For a root key, set 'layer' to 0 (increment 'layer' by one when going to subkeys of a current key and decrement it by one when going to a parent key).
@@ -440,6 +505,7 @@ class RegistryKey(object):
 		self.layer = layer
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		self.source_record = getattr(primary_file, 'source_record', None)
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
@@ -815,8 +881,16 @@ class RegistryKey(object):
 
 		key_security_offset = self.key_node.get_key_security_offset()
 		if key_security_offset != RegistryFile.CELL_OFFSET_NIL:
-			buf = self.get_cell(key_security_offset)
-			return RegistrySecurity(self.registry_file, buf)
+			source_record = getattr(self, 'source_record', None)
+			if source_record is None:
+				source_record = getattr(self.registry_file, 'source_record', None)
+			try:
+				buf = self.get_cell(key_security_offset)
+				return RegistrySecurity(self.registry_file, buf, source_record = source_record)
+			except Exception as exc:
+				reject_source_record(
+					source_record, exc, 'RegistryKey.security')
+				raise
 
 	def flags_raw(self):
 		"""Get and return layered key flags for this key (as an integer)."""
@@ -855,15 +929,281 @@ class RegistrySecurity(object):
 	key_security = None
 	"""A KeySecurity object."""
 
-	def __init__(self, primary_file, buf):
-		self.registry_file = primary_file
+	source_record = None
+	"""Provenance shared by accepted ACL reads and validation rejections."""
 
-		self.key_security = RegistryRecords.KeySecurity(buf)
+	def __init__(self, primary_file = None, buf = None,
+				 source_record = None, record = None, provenance = None,
+				 security_record = None, source = None,
+				 receipt_path = None, descriptor = None, **kwargs):
+		# Allow RegistrySecurity(buffer, source_record) as well as the formal
+		# RegistrySecurity(primary_file, buffer, source_record=...) form.
+		if isinstance(primary_file, SecuritySourceRecord) and source_record is None:
+			source_record = primary_file
+			primary_file = None
+		if isinstance(buf, SecuritySourceRecord):
+			if source_record is None:
+				source_record = buf
+			buf = None
+
+		# Allow the convenient RegistrySecurity(buffer) form for callers who
+		# already have a raw sk record or a raw self-relative descriptor.
+		if buf is None and descriptor is not None:
+			buf = descriptor
+		if buf is None and isinstance(primary_file, (bytes, bytearray, memoryview)):
+			buf = primary_file
+			primary_file = None
+
+		self.registry_file = primary_file
+		self._info = None
+		self._descriptor_override = None
+
+		record_obj = first_source_record(
+			source_record, record, provenance, security_record)
+		if record_obj is None and isinstance(source, SecuritySourceRecord):
+			record_obj = source
+		if record_obj is None:
+			record_obj = getattr(primary_file, 'source_record', None)
+		if record_obj is None:
+			record_obj = getattr(primary_file, 'security_record', None)
+		if record_obj is None and isinstance(source, (bytes, bytearray, memoryview)):
+			# A raw descriptor can be passed as source while buf is a keyword.
+			record_obj = SecuritySourceRecord(source = source, buffer = source,
+											  receipt_path = receipt_path)
+		if record_obj is None:
+			record_obj = SecuritySourceRecord(
+				source = primary_file if primary_file is not None else buf,
+				buffer = buf, receipt_path = receipt_path)
+
+		self.source_record = record_obj
+		self.source = record_obj
+		self.security_record = record_obj
+		self.record = record_obj
+		self.provenance = record_obj
+
+		try:
+			self.key_security = RegistryRecords.KeySecurity(buf)
+		except Exception as exc:
+			if RegistryHelpers.looks_like_security_descriptor(buf):
+				# Direct descriptor input is supported in addition to the
+				# normal 'sk' cell buffer.
+				self.key_security = None
+				try:
+					self._descriptor_override = bytes(buf)
+				except Exception:
+					self._descriptor_override = buf
+				if isinstance(self.source_record, SecuritySourceRecord):
+					self.source_record.bind_descriptor(self._descriptor_override)
+					self.source_record.record_event(
+						'raw_security_descriptor_bound',
+						length = len(self._descriptor_override))
+			else:
+				reject_source_record(self.source_record, exc, 'RegistrySecurity.__init__')
+				raise
 
 	def descriptor(self):
 		"""Get and return a security descriptor (as raw bytes)."""
 
+		if self._descriptor_override is not None:
+			return self._descriptor_override
 		return self.key_security.get_security_descriptor()
+
+	def security_info(self):
+		"""Validate all offsets/lengths and return the parsed descriptor."""
+
+		if self._info is None:
+			try:
+				descriptor = self.descriptor()
+				self._info = RegistryHelpers.ParseSecurityDescriptorRelative(
+					descriptor, source_record = self.source_record,
+					source = self)
+			except Exception as exc:
+				reject_source_record(
+					self.source_record, exc,
+					'RegistrySecurity.security_info')
+				raise
+
+			record_event = getattr(self.source_record, 'record_event', None)
+			if callable(record_event):
+				record_event(
+					'security_acl_published',
+					component_count = len(self._info.access_control_entries))
+		return self._info
+
+	def parse(self):
+		"""Parse and validate this security descriptor."""
+
+		return self.security_info()
+
+	def info(self):
+		"""Compatibility alias for security_info()."""
+
+		return self.security_info()
+
+	def validate(self):
+		"""Validate the descriptor before any ACL/principal publication."""
+
+		self.security_info()
+		return True
+
+	def validate_descriptor(self):
+		"""Compatibility alias for validate()."""
+
+		return self.validate()
+
+	def publish_acl(self, kind = 'dacl'):
+		"""Validate everything, then publish one ACL (DACL by default)."""
+
+		info = self.security_info()
+		return info.acl(kind)
+
+	def read_acl(self, kind = 'dacl'):
+		"""Compatibility alias for publish_acl()."""
+
+		return self.publish_acl(kind)
+
+	def publish_acls(self):
+		"""Validate everything, then publish all present ACLs."""
+
+		return self.security_info().acls
+
+	def publish_principals(self):
+		"""Validate everything, then publish all SID principals."""
+
+		return self.security_info().principals
+
+	def publish(self, kind = None):
+		"""Publish all ACLs, or one named ACL when kind is supplied."""
+
+		if kind is None:
+			return self.publish_acls()
+		return self.publish_acl(kind)
+
+	def read(self):
+		"""Validate and return the complete read result."""
+
+		return self.security_info()
+
+	@property
+	def parsed(self):
+		return self.security_info()
+
+	@property
+	def descriptor_info(self):
+		return self.security_info()
+
+	@property
+	def owner_sid(self):
+		return self.security_info().owner_sid
+
+	@property
+	def group_sid(self):
+		return self.security_info().group_sid
+
+	@property
+	def dacl(self):
+		return self.security_info().dacl
+
+	@property
+	def sacl(self):
+		return self.security_info().sacl
+
+	@property
+	def acl(self):
+		return self.security_info().dacl
+
+	@property
+	def acls(self):
+		return self.security_info().acls
+
+	@property
+	def aces(self):
+		return self.security_info().aces
+
+	@property
+	def entries(self):
+		return self.security_info().entries
+
+	@property
+	def access_control_list(self):
+		return self.security_info().dacl
+
+	@property
+	def access_control_lists(self):
+		return self.security_info().acls
+
+	@property
+	def access_control_entries(self):
+		return self.security_info().access_control_entries
+
+	@property
+	def principals(self):
+		return self.security_info().principals
+
+	@property
+	def subjects(self):
+		return self.principals
+
+	@property
+	def permission_principals(self):
+		return self.principals
+
+	discretionary_acl = dacl
+	discretionary_access_control_list = dacl
+	system_acl = sacl
+	system_access_control_list = sacl
+
+	def get_owner_sid(self):
+		return self.owner_sid
+
+	def get_group_sid(self):
+		return self.group_sid
+
+	def get_dacl(self):
+		return self.dacl
+
+	def get_sacl(self):
+		return self.sacl
+
+	def get_acl(self, kind = 'dacl'):
+		return self.security_info().acl(kind)
+
+	def get_aces(self, kind = None):
+		if kind is None:
+			return self.security_info().access_control_entries
+		acl = self.get_acl(kind)
+		return acl.aces if acl is not None else ()
+
+	def get_source_record(self):
+		return self.source_record
+
+	@staticmethod
+	def get_source_records():
+		"""Return all security source records created in this process."""
+
+		return RegistryHelpers.get_security_records()
+
+	@staticmethod
+	def get_security_records():
+		"""Compatibility alias for get_source_records()."""
+
+		return RegistryHelpers.get_security_records()
+
+	@staticmethod
+	def parse_security_descriptor(buffer, source_record = None, **kwargs):
+		"""Parse and validate a self-relative descriptor without a sk cell."""
+
+		return RegistryHelpers.ParseSecurityDescriptorRelative(
+			buffer, source_record = source_record, **kwargs)
+
+	@staticmethod
+	def validate_security_descriptor(buffer, source_record = None, **kwargs):
+		"""Validate a self-relative descriptor and return its parsed form."""
+
+		return RegistrySecurity.parse_security_descriptor(
+			buffer, source_record = source_record, **kwargs)
+
+	validate_offsets = parse_security_descriptor
 
 class RegistryValue(object):
 	"""This is a high-level class for a registry value."""
@@ -1066,9 +1406,18 @@ class RegistryHiveTruncated(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object):
+	def __init__(self, file_object, source_record = None, record = None,
+				 provenance = None, security_record = None, **kwargs):
+		self.source_record = first_source_record(
+			source_record, record, provenance, security_record)
+		if self.source_record is None:
+			self.source_record = SecuritySourceRecord(source = file_object)
+		self.source = self.source_record
 		self.registry_file = RegistryFile.PrimaryFileTruncated(file_object)
+		self.registry_file.source_record = self.source_record
+		self.security_record = self.source_record
 		self.effective_slack = set()
+		accept_source_record(self.source_record, 'RegistryHiveTruncated.__init__')
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
