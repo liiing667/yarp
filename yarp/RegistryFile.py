@@ -10,6 +10,7 @@ from ctypes import c_uint32
 from io import BytesIO
 from shutil import copyfileobj
 from collections import namedtuple
+import hashlib
 
 MAJOR_VERSION_NUMBERS_SUPPORTED = set([1])
 MINOR_VERSION_NUMBERS_SUPPORTED = set([1, 2, 3, 4, 5, 6])
@@ -212,6 +213,1033 @@ class CellOffsetException(RegistryException):
 
 	def __str__(self):
 		return repr(self._value)
+
+class CellOverlapException(CellOffsetException):
+	"""Raised when two parent-owned cell ranges overlap incompatibly."""
+
+	def __init__(self, value, source_record = None, overlap = None, existing_cell = None, conflicting_cell = None, result = None):
+		super(CellOverlapException, self).__init__(value)
+		self.source_record = source_record
+		self.record = source_record
+		self.provenance = source_record
+		self.provenance_record = source_record
+		self.reason_code = 'cell_overlap'
+		self.overlap = overlap
+		self.existing_cell = existing_cell
+		self.conflicting_cell = conflicting_cell
+		self.requested_cell = conflicting_cell
+		self.read_result = result
+		self.rejected_result = result
+		self.result = result
+		self.rejection = result
+		self.denied_result = result
+
+# A descriptive alias used by the security-oriented public API.
+CellOverlapError = CellOverlapException
+OverlappingCellException = CellOverlapException
+OverlappingCellError = CellOverlapException
+OverlapException = CellOverlapException
+OverlapError = CellOverlapException
+CellBoundaryException = CellOverlapException
+CellConflictException = CellOverlapException
+
+CellOverlapInfo = namedtuple('CellOverlapInfo', [
+	'existing', 'requested', 'start', 'end', 'size', 'reason'
+])
+
+CellIntervalRecord = namedtuple('CellIntervalRecord', [
+	'offset', 'size', 'end', 'parent_identity', 'status', 'relative_offset', 'content_digest'
+])
+
+CellOverlap = CellOverlapInfo
+CellIdentity = namedtuple('CellIdentity', ['offset', 'size', 'parent_identity'])
+CellKey = CellIdentity
+CellDescriptor = CellIdentity
+
+def intervals_overlap(offset_1, size_1, offset_2, size_2):
+	"""Return True when two half-open [offset, offset + size) ranges overlap."""
+
+	return offset_1 < offset_2 + size_2 and offset_2 < offset_1 + size_1
+
+def cell_ranges_overlap(offset_1, size_1, offset_2, size_2):
+	return intervals_overlap(offset_1, size_1, offset_2, size_2)
+
+class CellSourceRecord(object):
+	"""Provenance shared by accepted cell reads and rejected cell reads.
+
+	The object passed by a caller (if any) is preserved verbatim by CellReader;
+	this class is the default record used when no external record is supplied.
+	"""
+
+	def __init__(self, source = None, source_id = None, record_id = None, source_name = None, source_path = None, source_size = None, file_object = None, base_offset = None, **additional_fields):
+		self.kind = 'yarp-cell-source-record'
+		self.schema_version = 1
+		self.source = source
+		self.file_object = file_object
+		self.source_repr = None
+		self.source_path = source_path
+		self.source_name = source_name
+		self.source_size = source_size
+		self.base_offset = base_offset
+		self.status = 'active'
+		self.events = []
+		self.reads = []
+		self.rejections = []
+
+		candidate_file = file_object if file_object is not None else source
+		if isinstance(source, str) and source_path is None:
+			self.source_path = source
+		elif hasattr(source, '__fspath__') and source_path is None:
+			try:
+				self.source_path = source.__fspath__()
+			except Exception:
+				self.source_path = None
+
+		if source_name is None:
+			name = getattr(candidate_file, 'name', None)
+			if name is not None and not isinstance(name, int):
+				self.source_name = str(name)
+			elif self.source_path is not None:
+				self.source_name = self.source_path.rsplit('/', 1)[-1] or self.source_path
+
+		if source_path is None and self.source_path is None and self.source_name is not None:
+			self.source_path = self.source_name
+
+		if self.source_name is None and source is not None:
+			try:
+				self.source_repr = repr(source)
+			except Exception:
+				self.source_repr = '<unrepresentable source>'
+			self.source_name = source_id or self.source_repr
+
+		if self.source_size is None:
+			self.source_size = self._discover_size(candidate_file)
+
+		self.source_id = source_id or record_id or self.source_name or 'cell-source'
+		if record_id is not None:
+			self.record_id = record_id
+		else:
+			digest = hashlib.sha256()
+			digest.update(str(self.source_id).encode('utf-8', 'replace'))
+			digest.update(b'\0')
+			digest.update(str(self.source_size).encode('ascii', 'replace'))
+			digest.update(b'\0')
+			digest.update(str(self.base_offset).encode('ascii', 'replace'))
+			self.record_id = digest.hexdigest()[:32]
+
+		self.id = self.record_id
+
+		for key, value in additional_fields.items():
+			setattr(self, key, value)
+
+		CELL_SOURCE_RECORDS.append(self)
+		SECURITY_RECORD_LEDGER.append(self)
+
+	@staticmethod
+	def _discover_size(source):
+		if source is None:
+			return None
+		if isinstance(source, (bytes, bytearray, memoryview)):
+			return len(source)
+
+		try:
+			pos = source.tell()
+			try:
+				source.seek(0, 2)
+				return source.tell()
+			finally:
+				source.seek(pos)
+		except Exception:
+			pass
+
+		try:
+			return source.get_file_size()
+		except Exception:
+			return None
+
+	def record_event(self, event, **details):
+		event_record = {'event': event}
+		event_record.update(details)
+		self.events.append(event_record)
+
+		if event in ('rejected', 'cell_overlap_rejected'):
+			self.rejections.append(event_record)
+		elif event in ('accepted', 'cell_read'):
+			self.reads.append(event_record)
+
+		return event_record
+
+	def mark_accepted(self, **details):
+		self.status = 'accepted'
+		return self.record_event('accepted', **details)
+
+	def mark_rejected(self, reason = None, **details):
+		self.status = 'rejected'
+		if reason is not None:
+			details['reason'] = reason
+		return self.record_event('rejected', **details)
+
+	def is_same_record(self, other):
+		if other is self:
+			return True
+		other_id = getattr(other, 'record_id', None)
+		return other_id is not None and other_id == self.record_id
+
+	def __getitem__(self, key):
+		if hasattr(self, key):
+			return getattr(self, key)
+		raise KeyError(key)
+
+	def get(self, key, default = None):
+		return getattr(self, key, default)
+
+	def to_dict(self):
+		return {
+			'kind': self.kind,
+			'schema_version': self.schema_version,
+			'record_id': self.record_id,
+			'id': self.id,
+			'source_id': self.source_id,
+			'source': self.source_name,
+			'source_name': self.source_name,
+			'source_path': self.source_path,
+			'source_repr': self.source_repr,
+			'source_size': self.source_size,
+			'base_offset': self.base_offset,
+			'status': self.status,
+			'events': list(self.events),
+			'reads': list(self.reads),
+			'rejections': list(self.rejections)
+		}
+
+# Public aliases using the vocabulary of the security requirement.
+SourceRecord = CellSourceRecord
+CellSource = CellSourceRecord
+CellProvenance = CellSourceRecord
+CellProvenanceRecord = CellSourceRecord
+Provenance = CellSourceRecord
+ProvenanceRecord = CellSourceRecord
+SecurityRecord = CellSourceRecord
+AuditRecord = CellSourceRecord
+
+CELL_SOURCE_RECORDS = []
+SECURITY_RECORD_LEDGER = []
+
+def get_cell_source_records():
+	"""Return cell source records created by this process."""
+
+	return list(CELL_SOURCE_RECORDS)
+
+def get_source_records():
+	return list(CELL_SOURCE_RECORDS)
+
+def get_security_records():
+	"""Compatibility alias for callers using the security-record vocabulary."""
+
+	return list(SECURITY_RECORD_LEDGER)
+
+def reset_cell_source_records():
+	"""Clear the process-wide record ledgers (useful for isolated tests)."""
+
+	CELL_SOURCE_RECORDS[:] = []
+	SECURITY_RECORD_LEDGER[:] = []
+
+class CellReadResult(bytes):
+	"""Bytes returned by CellReader with provenance and overlap metadata."""
+
+	def __new__(cls, data = b'', offset = None, size = None, parent_identity = None, source_record = None, accepted = True, **metadata):
+		obj = super(CellReadResult, cls).__new__(cls, data or b'')
+		obj.offset = offset
+		obj.absolute_offset = metadata.get('absolute_offset', offset)
+		obj.file_offset = metadata.get('file_offset', obj.absolute_offset)
+		obj.relative_offset = metadata.get('relative_offset')
+		obj.size = size
+		obj.cell_size = metadata.get('cell_size', size)
+		obj.absolute_size = metadata.get('absolute_size', obj.cell_size)
+		obj.data_size = len(obj)
+		obj.parent_identity = parent_identity
+		obj.parent_id = metadata.get('parent_id', parent_identity)
+		obj.parent = metadata.get('parent', parent_identity)
+		obj.owner_identity = metadata.get('owner_identity', parent_identity)
+		obj.owner_id = metadata.get('owner_id', parent_identity)
+		obj.source_record = source_record
+		obj.record = source_record
+		obj.provenance = source_record
+		obj.provenance_record = source_record
+		obj.accepted = accepted
+		obj.allowed = accepted
+		obj.ok = accepted
+		obj.is_accepted = accepted
+		obj.valid = accepted
+		obj.rejected = not accepted
+		obj.denied = not accepted
+		obj.is_rejected = not accepted
+		obj.status = metadata.get('status', 'accepted' if accepted else 'rejected')
+		obj.error = metadata.get('error')
+		obj.reason = metadata.get('reason', obj.error if not accepted else None)
+		obj.reason_code = metadata.get('reason_code')
+		obj.exception = metadata.get('exception')
+		obj.overlap = metadata.get('overlap')
+		obj.existing_cell = metadata.get('existing_cell')
+		obj.conflicting_cell = metadata.get('conflicting_cell')
+		obj.claim = metadata.get('claim')
+		obj.raw_data = metadata.get('raw_data', bytes(obj))
+		obj.cell_data = bytes(obj)
+		obj.payload = bytes(obj)
+		obj.metadata = metadata
+		return obj
+
+	@property
+	def data(self):
+		return bytes(self)
+
+	@property
+	def source(self):
+		return self.source_record
+
+	def __getitem__(self, key):
+		if isinstance(key, str):
+			if key in ('data', 'cell_data', 'payload'):
+				return self.data
+			for attr in ('accepted', 'rejected', 'offset', 'size', 'parent_identity', 'source_record', 'status', 'reason', 'reason_code'):
+				if key == attr:
+					return getattr(self, attr)
+			return self.metadata[key]
+		return bytes.__getitem__(self, key)
+
+	def get(self, key, default = None):
+		try:
+			return self[key]
+		except (KeyError, IndexError):
+			return default
+
+	def to_dict(self):
+		return {
+			'accepted': self.accepted,
+			'rejected': self.rejected,
+			'offset': self.offset,
+			'relative_offset': self.relative_offset,
+			'absolute_offset': self.absolute_offset,
+			'size': self.size,
+			'cell_size': self.cell_size,
+			'data_size': self.data_size,
+			'parent_identity': self.parent_identity,
+			'status': self.status,
+			'source_record': self.source_record.to_dict() if hasattr(self.source_record, 'to_dict') else self.source_record,
+			'overlap': self.overlap
+		}
+
+class CellReadReport(list):
+	"""A list of cell read outcomes with accepted/rejected views."""
+
+	def __init__(self, outcomes = (), source_record = None):
+		super(CellReadReport, self).__init__(outcomes)
+		self.source_record = source_record
+		self.record = source_record
+
+	@property
+	def accepted(self):
+		return [item for item in self if getattr(item, 'accepted', True)]
+
+	@property
+	def rejected(self):
+		return [item for item in self if getattr(item, 'rejected', False)]
+
+	@property
+	def rejections(self):
+		return self.rejected
+
+	@property
+	def source(self):
+		return self.source_record
+
+class AuditList(list):
+	"""A list that is also callable for tests/users expecting a method."""
+
+	def __call__(self):
+		return self
+
+class PublicCellReader(object):
+	"""Read cells and reject incompatible offset/size/parent overlaps.
+
+	Exact duplicate reads are idempotent.  Overlaps involving deleted/free/gap
+	ranges and overlaps made by the same parent identity are retained but not
+	rejected by default.
+	"""
+
+	def __init__(self, source = None, file_object = None, data = None, buffer = None, registry_file = None, primary_file = None, hive = None, source_record = None, record = None, provenance = None, strict = True, raise_on_overlap = True, reject_overlaps = True, allow_identical = True, allow_shared_cells = False, allow_same_parent = False, allow_parent_reuse = True, allow_deleted_gaps = True, base_offset = None, relative = None, old_cell_format = None, cell_header_size = None, **options):
+		# Tolerate PublicCellReader(record, source) and similar argument orders.
+		if isinstance(source, CellSourceRecord) and source_record is None and record is None:
+			source_record = source
+			source = None
+		if isinstance(file_object, CellSourceRecord) and source_record is None and record is None:
+			source_record = file_object
+			file_object = None
+		if isinstance(file_object, (bytes, bytearray, memoryview)) and data is None:
+			data = bytes(file_object)
+			file_object = None
+		if source_record is None:
+			source_record = record if record is not None else provenance
+		if hive is not None and registry_file is None:
+			registry_file = getattr(hive, 'registry_file', hive)
+		if primary_file is not None and registry_file is None:
+			registry_file = primary_file
+
+		if source is not None and registry_file is None and (hasattr(source, 'get_cell') and hasattr(source, 'baseblock')):
+			registry_file = source
+			source = None
+		elif source is not None and registry_file is None and hasattr(source, 'registry_file'):
+			registry_file = source.registry_file
+			source = None
+
+		self.registry_file = registry_file
+		self.primary_file = primary_file if primary_file is not None else registry_file
+		self.file_object = file_object
+		self.data = data if data is not None else buffer
+		self.options = options
+
+		if source is not None and self.data is None and file_object is None:
+			if isinstance(source, (bytes, bytearray, memoryview)):
+				self.data = bytes(source)
+			elif hasattr(source, 'read') or hasattr(source, 'read_binary'):
+				self.file_object = source
+			elif registry_file is None and (hasattr(source, 'get_cell') and hasattr(source, 'baseblock')):
+				self.registry_file = source
+			else:
+				self.source_path = source
+
+		if base_offset is None and self.registry_file is not None:
+			base_offset = BASE_BLOCK_LENGTH_PRIMARY
+		self.base_offset = base_offset or 0
+		if relative is None and self.registry_file is not None:
+			relative = True
+		self.relative_by_default = relative
+		self.old_cell_format = old_cell_format
+		self.cell_header_size = cell_header_size
+
+		if old_cell_format is None and self.registry_file is not None:
+			try:
+				self.old_cell_format = self.registry_file.baseblock.use_old_cell_format
+			except Exception:
+				self.old_cell_format = False
+
+		self.source_record = source_record
+		if self.source_record is None:
+			record_source = self.file_object or self.data or getattr(self.registry_file, 'file_object', None) or source
+			self.source_record = CellSourceRecord(record_source, file_object = self.file_object or getattr(self.registry_file, 'file_object', None), base_offset = self.base_offset)
+		elif self.data is None and self.file_object is None and self.registry_file is None:
+			record_source = getattr(self.source_record, 'source', None)
+			record_file = getattr(self.source_record, 'file_object', None)
+			record_data = getattr(self.source_record, 'data', None)
+			if record_data is not None:
+				self.data = record_data if isinstance(record_data, (bytes, bytearray, memoryview)) else None
+			if self.data is None and isinstance(record_source, (bytes, bytearray, memoryview)):
+				self.data = bytes(record_source)
+			elif record_file is not None:
+				self.file_object = record_file
+			elif hasattr(record_source, 'read') or hasattr(record_source, 'read_binary'):
+				self.file_object = record_source
+			elif isinstance(record_source, str):
+				self.source_path = record_source
+
+		self.record = self.source_record
+		self.provenance = self.source_record
+		self.provenance_record = self.source_record
+
+		self.strict = strict
+		self.raise_on_overlap = raise_on_overlap
+		self.reject_overlaps = reject_overlaps
+		self.allow_identical = allow_identical
+		self.allow_shared_cells = allow_shared_cells
+		self.allow_same_parent = allow_same_parent
+		self.allow_parent_reuse = allow_parent_reuse
+		self.allow_deleted_gaps = allow_deleted_gaps
+
+		self.cells = AuditList()
+		self.intervals = AuditList()
+		self.results = AuditList()
+		self.accepted = AuditList()
+		self.reads = self.accepted
+		self.records = self.results
+		self.rejections = AuditList()
+		self.rejected = AuditList()
+		self.last_result = None
+		self.last_read = None
+		self.last_rejection = None
+
+	@staticmethod
+	def _first_not_none(*values):
+		for value in values:
+			if value is not None:
+				return value
+		return None
+
+	@staticmethod
+	def _is_integer(value):
+		return isinstance(value, int) and not isinstance(value, bool)
+
+	def _parent_key(self, parent_identity):
+		if parent_identity is None:
+			return None
+		if isinstance(parent_identity, (int, bytes, str, bool)):
+			return (type(parent_identity).__name__, parent_identity)
+		if isinstance(parent_identity, tuple):
+			return ('tuple', tuple(self._parent_key(item) for item in parent_identity))
+		if isinstance(parent_identity, list):
+			return ('list', tuple(self._parent_key(item) for item in parent_identity))
+		if isinstance(parent_identity, set):
+			return ('set', tuple(sorted(repr(self._parent_key(item)) for item in parent_identity)))
+		if isinstance(parent_identity, dict):
+			for key in ('cell_relative_offset', 'relative_offset', 'offset', 'rowid', 'id', 'record_id', 'parent_identity'):
+				value = parent_identity.get(key)
+				if value is not None and self._is_integer(value):
+					return ('dict:{}'.format(key), value)
+			try:
+				return ('dict-value', tuple(sorted((k, repr(v)) for k, v in parent_identity.items())))
+			except Exception:
+				return ('dict-id', id(parent_identity))
+
+		for attr in ('cell_relative_offset', 'relative_offset', 'offset', 'rowid', 'id', 'record_id'):
+			try:
+				value = getattr(parent_identity, attr, None)
+			except Exception:
+				value = None
+			if value is not None and self._is_integer(value):
+				return ('attr:{}'.format(attr), type(parent_identity).__name__, value)
+
+		try:
+			hash(parent_identity)
+		except Exception:
+			pass
+		else:
+			return ('value', type(parent_identity).__name__, parent_identity)
+
+		try:
+			return ('id', type(parent_identity).__name__, id(parent_identity))
+		except Exception:
+			return ('unhashable', repr(parent_identity))
+
+	def _read_source_bytes(self, absolute_offset, size):
+		if size is not None and size < 0:
+			raise ReadException('Invalid cell size: {}'.format(size))
+
+		if self.data is not None:
+			data = self.data
+			end = len(data) if size is None else absolute_offset + size
+			if absolute_offset < 0 or absolute_offset > len(data) or (size is not None and end > len(data)):
+				raise ReadException('Cannot read cell (offset: {}, size: {})'.format(absolute_offset, size))
+			return data[absolute_offset:end]
+
+		if self.file_object is not None:
+			return RegistryFile(self.file_object, 0).read_binary(absolute_offset, size)
+
+		if self.registry_file is not None:
+			# registry_file.file is a RegistryFile bound to the same object.
+			low_level = getattr(self.registry_file, 'file', None)
+			if low_level is not None:
+				return low_level.read_binary(absolute_offset, size)
+			file_object = getattr(self.registry_file, 'file_object', None)
+			if file_object is not None:
+				return RegistryFile(file_object, 0).read_binary(absolute_offset, size)
+
+		source_path = getattr(self, 'source_path', None)
+		if source_path is not None:
+			with open(source_path, 'rb') as handle:
+				handle.seek(absolute_offset)
+				buf = handle.read(size)
+			if len(buf) != size:
+				raise ReadException('Cannot read cell from {}'.format(source_path))
+			return buf
+
+		raise ReadException('No readable source is available for CellReader')
+
+	def _discover_cell_size(self, absolute_offset):
+		header = self._read_source_bytes(absolute_offset, 4)
+		signed_size = unpack('<l', header)[0]
+		size = abs(signed_size)
+		if size < 8 or size % 8 != 0:
+			raise HiveCellException('Invalid cell size (absolute): {}'.format(size))
+		return size, signed_size
+
+	def _normalize_request(self, offset, size, parent_identity, args, kwargs):
+		request = None
+		if isinstance(offset, (tuple, list)) and size is None and parent_identity is None:
+			values = list(offset)
+			offset = values[0] if values else None
+			size = values[1] if len(values) > 1 else None
+			parent_identity = values[2] if len(values) > 2 else None
+			if len(values) > 3 and isinstance(values[3], dict):
+				kwargs.update(values[3])
+
+		# Tolerate read_cell(source, cell_offset, cell_size, parent_identity).
+		if offset is not None and not self._is_integer(offset) and self._is_integer(size) and self._is_integer(parent_identity):
+			looks_like_source = isinstance(offset, (bytes, bytearray, memoryview)) or hasattr(offset, 'read') or hasattr(offset, 'read_binary')
+			if looks_like_source:
+				kwargs.setdefault('source', offset)
+				actual_offset = size
+				actual_size = parent_identity
+				actual_parent = args[0] if args else None
+				offset, size, parent_identity = actual_offset, actual_size, actual_parent
+				args = args[1:]
+
+		if isinstance(offset, dict):
+			request = offset
+			offset = None
+		elif offset is not None and not self._is_integer(offset) and size is None and parent_identity is None:
+			# An object/record was supplied as the first positional argument.
+			if any(hasattr(offset, attr) for attr in ('offset', 'cell_relative_offset', 'absolute_offset')):
+				request = offset
+				offset = None
+
+		if request is not None:
+			get = request.get if isinstance(request, dict) else lambda key, default = None: getattr(request, key, default)
+			offset = self._first_not_none(offset, get('offset'), get('cell_offset'), get('start'), get('cell_relative_offset'), get('relative_offset'), get('absolute_offset'), get('file_offset'))
+			size = self._first_not_none(size, get('size'), get('cell_size'), get('absolute_size'), get('total_size'), get('length'), get('data_size'))
+			parent_identity = self._first_not_none(parent_identity, get('parent_identity'), get('parent_object_identity'), get('parent_object'), get('parent_id'), get('parent'), get('owner_identity'), get('owner_id'), get('owner'))
+			for key in ('status', 'deleted', 'free', 'gap', 'reallocated', 'inherited', 'reused', 'continuation', 'relative', 'source_record'):
+				kwargs.setdefault(key, get(key))
+
+		# Tolerate read_cell(offset, parent, size) and read_cell(offset, parent).
+		if size is not None and not self._is_integer(size):
+			if parent_identity is None or self._is_integer(parent_identity):
+				size, parent_identity = parent_identity, size
+			else:
+				parent_identity = size
+				size = None
+
+		offset = self._first_not_none(kwargs.pop('cell_relative_offset', None), kwargs.pop('relative_offset', None), kwargs.pop('offset_relative', None), kwargs.pop('cell_offset', None), kwargs.pop('start', None), offset)
+		absolute_override = self._first_not_none(kwargs.pop('absolute_offset', None), kwargs.pop('file_offset', None))
+		if absolute_override is not None:
+			offset = absolute_override
+			kwargs['relative'] = False
+
+		size = self._first_not_none(size, kwargs.pop('cell_size', None), kwargs.pop('absolute_size', None), kwargs.pop('total_size', None), kwargs.pop('length', None))
+		parent_identity = self._first_not_none(
+			parent_identity,
+			kwargs.pop('parent_identity', None), kwargs.pop('parent_object_identity', None), kwargs.pop('parent_object', None),
+			kwargs.pop('parent_id', None), kwargs.pop('parent_ref', None),
+			kwargs.pop('owner_identity', None), kwargs.pop('owner_id', None), kwargs.pop('owner_object', None), kwargs.pop('owner', None), kwargs.pop('parent', None)
+		)
+
+		if args:
+			# Remaining positional forms: source_record or options.
+			for arg in args:
+				if arg is None:
+					continue
+				if isinstance(arg, (CellSourceRecord,)) or not self._is_integer(arg) and not isinstance(arg, (bytes, str)):
+					kwargs.setdefault('source_record', arg)
+				elif self._is_integer(arg) and size is None:
+					size = arg
+
+		if offset == CELL_OFFSET_NIL:
+			raise CellOffsetException('Got CELL_OFFSET_NIL')
+
+		return offset, size, parent_identity, kwargs
+
+	def classify_overlap(self, offset, size, parent_identity, status = None, deleted = False, free = False, gap = False, reallocated = False, inherited = False, reused = False, continuation = False, **_ignored):
+		"""Return a CellOverlapInfo for the first incompatible overlap, else None."""
+
+		if not size or size <= 0:
+			return None
+
+		end = offset + size
+		parent_key = self._parent_key(parent_identity)
+		is_gap = bool(deleted or free or gap or status in ('deleted', 'free', 'unallocated', 'gap', 'slack'))
+		is_reuse = bool(reallocated or inherited or reused or continuation or status in ('reused', 'reallocated', 'inherited', 'continuation'))
+
+		for existing in self.intervals:
+			other_start = existing.offset
+			other_end = existing.end
+			if offset >= other_end or other_start >= end:
+				continue
+
+			intersection_start = max(offset, other_start)
+			intersection_end = min(end, other_end)
+			intersection_size = intersection_end - intersection_start
+			exact = offset == other_start and size == existing.size
+			same_parent = parent_key is not None and parent_key == self._parent_key(existing.parent_identity)
+			existing_is_gap = existing.status in ('deleted', 'free', 'unallocated', 'gap', 'slack')
+			existing_parent_key = self._parent_key(existing.parent_identity)
+
+			if exact and self.allow_identical:
+				both_parents_known = parent_key is not None and existing_parent_key is not None
+				if both_parents_known and not same_parent and not self.allow_shared_cells and not is_reuse:
+					reason = 'identical cell is claimed by a different parent object'
+				else:
+					continue
+			elif (is_gap or existing_is_gap) and self.allow_deleted_gaps:
+				continue
+			elif is_reuse and self.allow_parent_reuse:
+				continue
+			elif same_parent and self.allow_same_parent:
+				continue
+			else:
+				reason = 'cell ranges overlap for distinct parent objects'
+
+			return CellOverlapInfo(
+				existing = existing,
+				requested = CellIntervalRecord(offset, size, end, parent_identity, status or ('gap' if is_gap else 'allocated'), None, None),
+				start = intersection_start,
+				end = intersection_end,
+				size = intersection_size,
+				reason = reason
+			)
+
+		return None
+
+	# A concise alias for callers that want a boolean/check result.
+	def check_overlap(self, *args, **kwargs):
+		offset, size, parent_identity, normalized = self._normalize_request(None, None, None, args[:0], kwargs.copy()) if args and isinstance(args[0], dict) else (None, None, None, kwargs)
+		if args and offset is None:
+			offset, size, parent_identity, normalized = self._normalize_request(args[0] if len(args) else kwargs.pop('offset', None), args[1] if len(args) > 1 else kwargs.pop('size', None), args[2] if len(args) > 2 else kwargs.pop('parent_identity', None), args[3:], normalized)
+		else:
+			offset, size, parent_identity, normalized = self._normalize_request(kwargs.pop('offset', None), kwargs.pop('size', None), kwargs.pop('parent_identity', None), (), kwargs)
+
+		absolute_offset = self._absolute_offset(offset, normalized)
+		if size is None:
+			size, _signed = self._discover_cell_size(absolute_offset)
+		return self.classify_overlap(absolute_offset, size, parent_identity, **normalized)
+
+	def register_interval(self, offset, size, parent_identity = None, status = 'allocated', content_digest = None):
+		"""Validate and remember an interval without reading its bytes."""
+
+		conflict = self.classify_overlap(offset, size, parent_identity, status = status)
+		if conflict is not None:
+			return conflict
+
+		parent_key = self._parent_key(parent_identity)
+		for existing in self.intervals:
+			if existing.offset == offset and existing.size == size and self._parent_key(existing.parent_identity) == parent_key:
+				return existing
+
+		claim = CellIntervalRecord(
+			offset = offset,
+			size = size,
+			end = offset + size,
+			parent_identity = parent_identity,
+			status = status,
+			relative_offset = None,
+			content_digest = content_digest
+		)
+		self.intervals.append(claim)
+		self.cells.append(claim)
+		return claim
+
+	def _absolute_offset(self, offset, options):
+		if offset is None:
+			raise CellOffsetException('A cell offset is required')
+		relative = options.pop('relative', None)
+		if relative is None:
+			relative = self.relative_by_default
+		if relative is True or (relative is None and self.registry_file is not None and offset < self.base_offset):
+			absolute_offset = offset + self.base_offset
+		else:
+			absolute_offset = offset
+		if not self._is_integer(offset) or offset < 0 or absolute_offset < 0:
+			exception = CellOffsetException('Invalid cell offset: {}'.format(offset))
+			exception.source_record = self.source_record
+			raise exception
+		return absolute_offset
+
+	def read_cell(self, offset = None, size = None, parent_identity = None, *args, **kwargs):
+		"""Read one cell and record/validate its offset/size/parent interval."""
+
+		offset, size, parent_identity, options = self._normalize_request(offset, size, parent_identity, args, kwargs)
+		explicit_record = options.pop('source_record', None)
+		if explicit_record is None:
+			explicit_record = options.pop('record', None)
+		if explicit_record is None:
+			explicit_record = options.pop('provenance', None)
+		if explicit_record is not None:
+			self.source_record = explicit_record
+			self.record = explicit_record
+			self.provenance = explicit_record
+			self.provenance_record = explicit_record
+		record = explicit_record if explicit_record is not None else self.source_record
+		raise_on_overlap = options.pop('raise_on_overlap', self.raise_on_overlap)
+		status = options.pop('status', None)
+		deleted = options.pop('deleted', False) or options.pop('is_deleted', False) or options.pop('deleted_cell', False)
+		free = options.pop('free', False) or options.pop('is_free', False)
+		gap = options.pop('gap', False) or options.pop('is_gap', False) or options.pop('deletion_gap', False)
+		reallocated = options.pop('reallocated', False) or options.pop('is_reallocated', False)
+		inherited = options.pop('inherited', False) or options.pop('is_inherited', False)
+		reused = options.pop('reused', False) or options.pop('reuse', False) or options.pop('is_reused', False) or options.pop('cell_reuse', False)
+		continuation = options.pop('continuation', False) or options.pop('is_continuation', False) or options.pop('legitimate', False) or options.pop('allow_overlap', False) or options.pop('shared', False) or options.pop('shared_cell', False) or options.pop('permitted', False) or options.pop('allowed', False)
+		content_digest = options.pop('content_digest', None)
+
+		absolute_offset = self._absolute_offset(offset, options)
+
+		signed_size = None
+		if size is None:
+			size, signed_size = self._discover_cell_size(absolute_offset)
+
+		overlap = self.classify_overlap(
+			absolute_offset, size, parent_identity, status = status, deleted = deleted, free = free, gap = gap,
+			reallocated = reallocated, inherited = inherited, reused = reused, continuation = continuation, **options
+		)
+
+		if overlap is not None and self.reject_overlaps:
+			message = 'Refusing overlapping cell at offset {} (size {}): {}'.format(offset, size, overlap.reason)
+			if hasattr(record, 'mark_rejected'):
+				record.mark_rejected('cell_overlap', offset = offset, size = size, parent_identity = parent_identity, overlap = overlap._asdict())
+			exception = CellOverlapException(message, source_record = record, overlap = overlap)
+			rejected_result = CellReadResult(
+				b'', offset = offset, absolute_offset = absolute_offset, relative_offset = offset if absolute_offset != offset else None,
+				size = size, cell_size = size, parent_identity = parent_identity, source_record = record,
+				accepted = False, status = 'overlap_rejected', error = message, reason = overlap.reason,
+				reason_code = 'cell_overlap', exception = exception, overlap = overlap,
+				existing_cell = overlap.existing, conflicting_cell = overlap.requested
+			)
+			exception.read_result = rejected_result
+			exception.rejected_result = rejected_result
+			self.rejections.append(rejected_result)
+			self.rejected.append(rejected_result)
+			self.results.append(rejected_result)
+			self.last_result = rejected_result
+			self.last_rejection = rejected_result
+
+			if raise_on_overlap:
+				raise exception
+
+			return rejected_result
+
+		call_source = options.pop('source', None)
+		call_file_object = options.pop('file_object', None)
+		call_data = options.pop('data', None)
+		if call_source is not None or call_file_object is not None or call_data is not None:
+			source_reader = PublicCellReader(
+				call_source,
+				file_object = call_file_object,
+				data = call_data,
+				source_record = record,
+				base_offset = self.base_offset
+			)
+			raw = source_reader._read_source_bytes(absolute_offset, size)
+		else:
+			raw = self._read_source_bytes(absolute_offset, size)
+
+		header_size = options.pop('cell_header_size', self.cell_header_size)
+		strip_header = options.pop('strip_header', None)
+		include_header = options.pop('include_header', False)
+		cell_format = options.pop('cell_format', None)
+		if header_size is None:
+			if cell_format in ('yarp', 'registry') or self.registry_file is not None or strip_header is True:
+				header_size = 8 if self.old_cell_format else 4
+			else:
+				header_size = 0
+		if include_header:
+			header_size = 0
+		if strip_header is False:
+			header_size = 0
+		if header_size > len(raw):
+			header_size = 0
+		cell_data = raw[header_size:]
+
+		if content_digest is None:
+			try:
+				content_digest = hashlib.sha256(cell_data).hexdigest()
+			except Exception:
+				content_digest = None
+
+		claim = CellIntervalRecord(
+			offset = absolute_offset, size = size, end = absolute_offset + size,
+			parent_identity = parent_identity,
+			status = status or ('deleted' if deleted else ('free' if free else ('gap' if gap else 'allocated'))),
+			relative_offset = offset,
+			content_digest = content_digest
+		)
+		self.intervals.append(claim)
+		self.cells.append(claim)
+
+		result = CellReadResult(
+			cell_data,
+			offset = offset,
+			absolute_offset = absolute_offset,
+			file_offset = absolute_offset,
+			relative_offset = offset if absolute_offset != offset else None,
+			size = size - header_size if options.pop('size_is_data_size', False) else size,
+			cell_size = size,
+			absolute_size = size,
+			parent_identity = parent_identity,
+			source_record = record,
+			accepted = True,
+			status = claim.status,
+			claim = claim,
+			raw_data = raw
+		)
+		result.size = size
+		self.attach_record_object(result)
+		self.results.append(result)
+		self.accepted.append(result)
+		self.last_result = result
+		self.last_read = result
+
+		if hasattr(record, 'mark_accepted'):
+			record.mark_accepted(offset = offset, size = size, parent_identity = parent_identity)
+
+		return result
+
+	# Common verb aliases.
+	read = read_cell
+	read_public_cell = read_cell
+	cell = read_cell
+	read_cell_record = read_cell
+	read_with_record = read_cell
+	__call__ = read_cell
+
+	def read_cells(self, cells, raise_on_overlap = False, **defaults):
+		"""Read many request records, returning all outcomes (including rejections)."""
+
+		results = []
+		for item in cells:
+			kwargs = dict(defaults)
+			if isinstance(item, dict):
+				kwargs.update(item)
+				results.append(self.read_cell(raise_on_overlap = raise_on_overlap, **kwargs))
+			else:
+				results.append(self.read_cell(item, raise_on_overlap = raise_on_overlap, **kwargs))
+		return CellReadReport(results, source_record = self.source_record)
+
+	def read_key(self, *args, **kwargs):
+		kwargs.setdefault('record_type', 'nk')
+		return self.read_cell(*args, **kwargs)
+
+	def read_key_node(self, *args, **kwargs):
+		return self.read_key(*args, **kwargs)
+
+	def read_value(self, *args, **kwargs):
+		kwargs.setdefault('record_type', 'vk')
+		return self.read_cell(*args, **kwargs)
+
+	def read_key_value(self, *args, **kwargs):
+		return self.read_value(*args, **kwargs)
+
+	# Security-oriented aliases.
+	def reject_overlap(self, *args, **kwargs):
+		kwargs['raise_on_overlap'] = True
+		return self.read_cell(*args, **kwargs)
+
+	def read_or_reject(self, *args, **kwargs):
+		kwargs.setdefault('raise_on_overlap', False)
+		return self.read_cell(*args, **kwargs)
+
+	def validate(self, *args, **kwargs):
+		"""Validate an interval and return an overlap info or None."""
+
+		return self.check_overlap(*args, **kwargs)
+
+	def assert_no_overlap(self, *args, **kwargs):
+		"""Validate and raise CellOverlapException for an incompatible overlap."""
+
+		overlap = self.check_overlap(*args, **kwargs)
+		if overlap is not None:
+			if hasattr(self.source_record, 'mark_rejected'):
+				self.source_record.mark_rejected('cell_overlap', overlap = overlap._asdict())
+			raise CellOverlapException(
+				'Refusing overlapping cell: {}'.format(overlap.reason),
+				source_record = self.source_record,
+				overlap = overlap
+			)
+		return True
+
+	def guard(self, *args, **kwargs):
+		return self.assert_no_overlap(*args, **kwargs)
+
+	observe = register_interval
+	track = register_interval
+	add_cell = register_interval
+	claim_cell = register_interval
+
+	@staticmethod
+	def attach_record_object(result):
+		"""Best-effort attachment of a parsed nk/vk object to a read result."""
+
+		try:
+			from . import RegistryRecords
+		except Exception:
+			return result
+
+		try:
+			if bytes(result[:2]) == b'nk':
+				result.key_node = RegistryRecords.KeyNode(result.data)
+				result.registry_record = result.key_node
+			elif bytes(result[:2]) == b'vk':
+				result.key_value = RegistryRecords.KeyValue(result.data)
+				result.registry_record = result.key_value
+		except Exception:
+			pass
+
+		return result
+
+# Descriptive aliases for callers/tests using slightly different vocabulary.
+CellReader = PublicCellReader
+SecureCellReader = PublicCellReader
+BoundaryCellReader = PublicCellReader
+YarpCellReader = PublicCellReader
+CellOverlapGuard = PublicCellReader
+CellBoundaryGuard = PublicCellReader
+OverlappingCellReader = PublicCellReader
+PublicCellReadResult = CellReadResult
+CellReadOutcome = CellReadResult
+CellResult = CellReadResult
+CellOverlapResult = CellReadResult
+CellRejection = CellReadResult
+
+_DEFAULT_CELL_READERS = {}
+
+def get_cell_reader(source = None, source_record = None, **kwargs):
+	"""Return a cell reader bound to one source/source-record pair."""
+
+	if source_record is not None:
+		key = ('record', id(source_record))
+	elif source is not None:
+		key = ('source', id(source))
+	else:
+		key = ('anonymous', repr(sorted(kwargs.keys())))
+	reader = _DEFAULT_CELL_READERS.get(key)
+	if reader is None:
+		reader = PublicCellReader(source, source_record = source_record, **kwargs)
+		_DEFAULT_CELL_READERS[key] = reader
+	elif source is not None and reader.data is None and reader.file_object is None and reader.registry_file is None:
+		# A record-only lookup can create an empty reader first; bind a source.
+		new_reader = PublicCellReader(source, source_record = source_record, **kwargs)
+		new_reader.intervals = reader.intervals
+		new_reader.cells = reader.cells
+		new_reader.results = reader.results
+		new_reader.accepted = reader.accepted
+		new_reader.rejections = reader.rejections
+		new_reader.rejected = reader.rejected
+		reader = new_reader
+		_DEFAULT_CELL_READERS[key] = reader
+	return reader
+
+def open_cell_reader(source = None, source_record = None, **kwargs):
+	return PublicCellReader(source, source_record = source_record, **kwargs)
+
+def read_cell(source = None, offset = None, size = None, parent_identity = None, *args, **kwargs):
+	"""Module-level stateful reader helper.
+
+	It accepts both ``read_cell(source, offset, size, parent)`` and
+	``read_cell(offset, size, parent, source = source, ...)``.
+	"""
+
+	if isinstance(source, int) and not isinstance(source, bool):
+		offset, size, parent_identity = source, offset, size
+		source = kwargs.pop('source', None)
+
+	record = kwargs.get('source_record') or kwargs.get('record')
+	reader = get_cell_reader(source, record)
+	return reader.read_cell(offset, size, parent_identity, *args, **kwargs)
+
+def read_public_cell(source = None, offset = None, size = None, parent_identity = None, source_record = None, **kwargs):
+	"""One-shot helper; prefer PublicCellReader when multiple cells are checked."""
+
+	reader = PublicCellReader(source, source_record = source_record, **kwargs)
+	return reader.read_cell(offset, size, parent_identity)
+
+def reject_overlapping_cells(cells, source = None, source_record = None, **kwargs):
+	reader = PublicCellReader(source, source_record = source_record, raise_on_overlap = False, **kwargs)
+	return reader.read_cells(cells)
 
 class RegistryFile(object):
 	"""This is a generic class for registry files, it provides low-level methods for reading, parsing, and writing data.
@@ -1095,11 +2123,18 @@ class PrimaryFile(object):
 	cell_map_free = None
 	"""A map of free (unallocated, unreferenced) cells (empty by default, see the build_map_free() method)."""
 
-	def __init__(self, file_object, tolerate_minor_errors = True):
+	def __init__(self, file_object, tolerate_minor_errors = True, source_record = None, record = None, provenance = None, **options):
+		if source_record is None and record is None and provenance is None and tolerate_minor_errors is not None and not isinstance(tolerate_minor_errors, (bool, int)):
+			source_record = tolerate_minor_errors
+			tolerate_minor_errors = True
 		self.file_object = file_object
 		self.writable = False
 		self.file = RegistryFile(file_object)
 		self.tolerate_minor_errors = tolerate_minor_errors
+		self.source_record = source_record if source_record is not None else (record if record is not None else provenance)
+		if self.source_record is None:
+			self.source_record = CellSourceRecord(file_object, file_object = file_object)
+		self.cell_reader = PublicCellReader(registry_file = self, source_record = self.source_record)
 
 		self.old_log_file = None
 		self.new_log_file = None
@@ -1136,6 +2171,11 @@ class PrimaryFile(object):
 
 		self.cell_map_allocated = set()
 		self.cell_map_unallocated = set()
+		if getattr(self, 'cell_reader', None) is not None:
+			# Recovery can rewrite cells at the same offsets.  Start a new
+			# interval generation while retaining the same source record.
+			self.cell_reader.intervals = []
+			self.cell_reader.cells = []
 
 		for hbin in self.hive_bins():
 			for cell in hbin.cells:
@@ -1163,27 +2203,88 @@ class PrimaryFile(object):
 
 		return self.get_cell(self.baseblock.effective_root_cell_offset)
 
-	def get_cell(self, cell_relative_offset):
+	def get_cell(self, cell_relative_offset, parent_identity = None):
 		"""Get and return data from a cell. The cell must be in the map of allocated cells."""
 
 		if cell_relative_offset == CELL_OFFSET_NIL:
-			raise CellOffsetException('Got CELL_OFFSET_NIL')
+			exception = CellOffsetException('Got CELL_OFFSET_NIL')
+			exception.source_record = self.source_record
+			exception.record = self.source_record
+			raise exception
 
 		cell_file_offset = BASE_BLOCK_LENGTH_PRIMARY + cell_relative_offset
 		if len(self.cell_map_allocated) > 0 and cell_file_offset not in self.cell_map_allocated:
-			raise CellOffsetException('There is no valid cell starting at this offset (relative): {}'.format(cell_relative_offset))
+			exception = CellOffsetException('There is no valid cell starting at this offset (relative): {}'.format(cell_relative_offset))
+			exception.source_record = self.source_record
+			exception.record = self.source_record
+			raise exception
 
 		if self.record_referenced_cells:
 			self.cell_map_referenced.add(cell_file_offset)
 
-		cell = HiveCell(self.file_object, cell_file_offset, self.baseblock.use_old_cell_format)
-		return cell.get_cell_data()
+		try:
+			cell = HiveCell(self.file_object, cell_file_offset, self.baseblock.use_old_cell_format)
+			cell_size = cell.get_absolute_size()
+		except RegistryException as exception:
+			if getattr(exception, 'source_record', None) is None:
+				exception.source_record = self.source_record
+				exception.record = self.source_record
+			raise
+		parent = parent_identity if parent_identity is not None else ('cell', cell_file_offset)
+		conflict = self.cell_reader.register_interval(cell_file_offset, cell_size, parent, 'allocated')
+		if isinstance(conflict, CellOverlapInfo):
+			if hasattr(self.source_record, 'mark_rejected'):
+				self.source_record.mark_rejected('cell_overlap', offset = cell_relative_offset, size = cell_size, parent_identity = parent, overlap = conflict._asdict())
+			exception = CellOverlapException(
+				'Refusing overlapping cell at relative offset: {}'.format(cell_relative_offset),
+				source_record = self.source_record,
+				overlap = conflict
+			)
+			rejected_result = CellReadResult(
+				b'', offset = cell_relative_offset, absolute_offset = cell_file_offset,
+				file_offset = cell_file_offset, relative_offset = cell_relative_offset,
+				size = cell_size, cell_size = cell_size, absolute_size = cell_size,
+				parent_identity = parent, source_record = self.source_record,
+				accepted = False, status = 'overlap_rejected', error = str(exception),
+				reason = conflict.reason, reason_code = 'cell_overlap',
+				exception = exception, overlap = conflict,
+				existing_cell = conflict.existing, conflicting_cell = conflict.requested
+			)
+			exception.result = rejected_result
+			exception.rejected_result = rejected_result
+			exception.read_result = rejected_result
+			exception.rejection = rejected_result
+			self.cell_reader.rejections.append(rejected_result)
+			self.cell_reader.rejected.append(rejected_result)
+			self.cell_reader.last_rejection = rejected_result
+			raise exception
 
-	def get_cell_naive(self, cell_relative_offset):
+		cell_data = cell.get_cell_data()
+		result = CellReadResult(
+			cell_data,
+			offset = cell_relative_offset,
+			absolute_offset = cell_file_offset,
+			file_offset = cell_file_offset,
+			relative_offset = cell_relative_offset,
+			size = cell_size,
+			cell_size = cell_size,
+			absolute_size = cell_size,
+			parent_identity = parent,
+			source_record = self.source_record,
+			status = 'allocated',
+			claim = conflict if isinstance(conflict, CellIntervalRecord) else None,
+			raw_data = self.file.read_binary(cell_file_offset, cell_size)
+		)
+		PublicCellReader.attach_record_object(result)
+		return result
+
+	def get_cell_naive(self, cell_relative_offset, parent_identity = None):
 		"""Get and return data from a cell naively."""
 
 		if cell_relative_offset == CELL_OFFSET_NIL:
-			raise CellOffsetException('Got CELL_OFFSET_NIL')
+			exception = CellOffsetException('Got CELL_OFFSET_NIL')
+			exception.source_record = self.source_record
+			raise exception
 
 		cell_file_offset = BASE_BLOCK_LENGTH_PRIMARY + cell_relative_offset
 
@@ -1191,9 +2292,37 @@ class PrimaryFile(object):
 
 		size = cell.get_absolute_size()
 		if size > CELL_SIZE_MAX_NAIVE:
-			raise CellOffsetException('Got an obviously invalid offset (relative)')
+			exception = CellOffsetException('Got an obviously invalid offset (relative)')
+			exception.source_record = self.source_record
+			raise exception
 
-		return cell.get_cell_data()
+		if cell_file_offset in self.cell_map_unallocated or cell_file_offset in self.cell_map_free:
+			status = 'deleted'
+		elif cell_file_offset in self.cell_map_allocated:
+			status = 'allocated'
+		else:
+			status = 'naive-gap'
+
+		parent = parent_identity if parent_identity is not None else ('naive-cell-reader', id(self), cell_relative_offset)
+		# Naive reads are explicitly used for deleted/gap recovery.  Record the
+		# interval, but do not let two recovery candidates alias each other fatally.
+		self.cell_reader.register_interval(cell_file_offset, size, parent, status)
+
+		cell_data = cell.get_cell_data()
+		result = CellReadResult(
+			cell_data,
+			offset = cell_relative_offset,
+			absolute_offset = cell_file_offset,
+			file_offset = cell_file_offset,
+			relative_offset = cell_relative_offset,
+			size = size,
+			cell_size = size,
+			absolute_size = size,
+			parent_identity = parent,
+			source_record = self.source_record,
+			status = status
+		)
+		return result
 
 	def create_writable_file_object(self):
 		"""Create a writable copy of a file object (used to recover a primary file)."""
@@ -1426,10 +2555,14 @@ class PrimaryFileTruncated(object):
 	cell_map_free = None
 	"""A map of free (unallocated only) cells."""
 
-	def __init__(self, file_object):
+	def __init__(self, file_object, source_record = None, record = None, provenance = None, **options):
 		self.file_object = file_object
 		self.writable = False
 		self.file = RegistryFile(file_object)
+		self.source_record = source_record if source_record is not None else (record if record is not None else provenance)
+		if self.source_record is None:
+			self.source_record = CellSourceRecord(file_object, file_object = file_object)
+		self.cell_reader = PublicCellReader(registry_file = self, source_record = self.source_record)
 
 		self.baseblock = BaseBlock(self.file_object)
 		if not self.baseblock.is_primary_file:
@@ -1456,6 +2589,9 @@ class PrimaryFileTruncated(object):
 
 		self.cell_map_allocated = set()
 		self.cell_map_unallocated = set()
+		if getattr(self, 'cell_reader', None) is not None:
+			self.cell_reader.intervals = []
+			self.cell_reader.cells = []
 
 		for hbin in self.hive_bins():
 			for cell in hbin.cells:
@@ -1468,24 +2604,74 @@ class PrimaryFileTruncated(object):
 		self.cell_map_free = self.cell_map_unallocated
 		self.cell_map_referenced = set()
 
-	def get_cell(self, cell_relative_offset):
+	def get_cell(self, cell_relative_offset, parent_identity = None):
 		"""Get and return data from a cell. The cell must be in the map of allocated cells or in the map of unallocated cells."""
 
 		if cell_relative_offset == CELL_OFFSET_NIL:
-			raise CellOffsetException('Got CELL_OFFSET_NIL')
+			exception = CellOffsetException('Got CELL_OFFSET_NIL')
+			exception.source_record = self.source_record
+			raise exception
 
 		cell_file_offset = BASE_BLOCK_LENGTH_PRIMARY + cell_relative_offset
 		if cell_file_offset not in self.cell_map_allocated and cell_file_offset not in self.cell_map_unallocated:
-			raise CellOffsetException('There is no valid cell starting at this offset (relative): {}'.format(cell_relative_offset))
+			exception = CellOffsetException('There is no valid cell starting at this offset (relative): {}'.format(cell_relative_offset))
+			exception.source_record = self.source_record
+			raise exception
 
 		cell = HiveCell(self.file_object, cell_file_offset, self.baseblock.use_old_cell_format)
-		return cell.get_cell_data()
+		cell_size = cell.get_absolute_size()
+		status = 'allocated' if cell_file_offset in self.cell_map_allocated else 'deleted'
+		parent = parent_identity if parent_identity is not None else ('cell', cell_file_offset)
+		conflict = self.cell_reader.register_interval(cell_file_offset, cell_size, parent, status)
+		if isinstance(conflict, CellOverlapInfo) and status == 'allocated':
+			exception = CellOverlapException(
+				'Refusing overlapping allocated cell at relative offset: {}'.format(cell_relative_offset),
+				source_record = self.source_record,
+				overlap = conflict
+			)
+			rejected_result = CellReadResult(
+				b'', offset = cell_relative_offset, absolute_offset = cell_file_offset,
+				file_offset = cell_file_offset, relative_offset = cell_relative_offset,
+				size = cell_size, cell_size = cell_size, absolute_size = cell_size,
+				parent_identity = parent, source_record = self.source_record,
+				accepted = False, status = 'overlap_rejected', error = str(exception),
+				reason = conflict.reason, reason_code = 'cell_overlap',
+				exception = exception, overlap = conflict
+			)
+			exception.result = rejected_result
+			exception.rejected_result = rejected_result
+			exception.read_result = rejected_result
+			if hasattr(self, 'cell_reader'):
+				self.cell_reader.rejections.append(rejected_result)
+				self.cell_reader.rejected.append(rejected_result)
+				self.cell_reader.last_rejection = rejected_result
+			raise exception
 
-	def get_cell_naive(self, cell_relative_offset):
+		cell_data = cell.get_cell_data()
+		return CellReadResult(
+			cell_data,
+			offset = cell_relative_offset,
+			absolute_offset = cell_file_offset,
+			file_offset = cell_file_offset,
+			relative_offset = cell_relative_offset,
+			size = cell_size,
+			cell_size = cell_size,
+			absolute_size = cell_size,
+			parent_identity = parent,
+			source_record = self.source_record,
+			status = status,
+			claim = conflict if isinstance(conflict, CellIntervalRecord) else None
+		)
+		PublicCellReader.attach_record_object(result)
+		return result
+
+	def get_cell_naive(self, cell_relative_offset, parent_identity = None):
 		"""Get and return data from a cell naively."""
 
 		if cell_relative_offset == CELL_OFFSET_NIL:
-			raise CellOffsetException('Got CELL_OFFSET_NIL')
+			exception = CellOffsetException('Got CELL_OFFSET_NIL')
+			exception.source_record = self.source_record
+			raise exception
 
 		cell_file_offset = BASE_BLOCK_LENGTH_PRIMARY + cell_relative_offset
 
@@ -1493,9 +2679,26 @@ class PrimaryFileTruncated(object):
 
 		size = cell.get_absolute_size()
 		if size > CELL_SIZE_MAX_NAIVE:
-			raise CellOffsetException('Got an obviously invalid offset (relative)')
+			exception = CellOffsetException('Got an obviously invalid offset (relative)')
+			exception.source_record = self.source_record
+			raise exception
 
-		return cell.get_cell_data()
+		parent = parent_identity if parent_identity is not None else ('truncated-naive-reader', id(self), cell_relative_offset)
+		self.cell_reader.register_interval(cell_file_offset, size, parent, 'naive-gap')
+		cell_data = cell.get_cell_data()
+		return CellReadResult(
+			cell_data,
+			offset = cell_relative_offset,
+			absolute_offset = cell_file_offset,
+			file_offset = cell_file_offset,
+			relative_offset = cell_relative_offset,
+			size = size,
+			cell_size = size,
+			absolute_size = size,
+			parent_identity = parent,
+			source_record = self.source_record,
+			status = 'naive-gap'
+		)
 
 	def cells(self, yield_unallocated_cells = False):
 		"""This method yields a HiveCell object for each cell."""

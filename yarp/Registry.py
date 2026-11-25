@@ -8,6 +8,14 @@ from __future__ import unicode_literals, division
 
 from .RegistryFile import RegistryException, BASE_BLOCK_LENGTH_PRIMARY
 from . import RegistryFile, RegistryRecords, RegistryUnicode
+from .RegistryFile import (
+	CellOverlapError,
+	CellOverlapException,
+	CellReader,
+	CellSourceRecord,
+	PublicCellReader,
+	SourceRecord,
+)
 from struct import unpack
 from datetime import datetime, timedelta
 from collections import namedtuple
@@ -203,8 +211,15 @@ class RegistryHive(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object, tolerate_minor_errors = True):
-		self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+	def __init__(self, file_object, tolerate_minor_errors = True, source_record = None, record = None, provenance = None):
+		if source_record is None and record is None and provenance is None and tolerate_minor_errors is not None and not isinstance(tolerate_minor_errors, (bool, int)):
+			source_record = tolerate_minor_errors
+			tolerate_minor_errors = True
+		record = source_record if source_record is not None else (record if record is not None else provenance)
+		self.source_record = record
+		self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors, source_record = record)
+		self.source_record = self.registry_file.source_record
+		self.cell_reader = self.registry_file.cell_reader
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
 
@@ -1066,8 +1081,12 @@ class RegistryHiveTruncated(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object):
-		self.registry_file = RegistryFile.PrimaryFileTruncated(file_object)
+	def __init__(self, file_object, source_record = None, record = None, provenance = None):
+		source_record = source_record if source_record is not None else (record if record is not None else provenance)
+		self.source_record = source_record
+		self.registry_file = RegistryFile.PrimaryFileTruncated(file_object, source_record = source_record)
+		self.source_record = self.registry_file.source_record
+		self.cell_reader = self.registry_file.cell_reader
 		self.effective_slack = set()
 
 	def last_written_timestamp(self):
