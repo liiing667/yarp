@@ -1095,6 +1095,11 @@ class PrimaryFile(object):
 	cell_map_free = None
 	"""A map of free (unallocated, unreferenced) cells (empty by default, see the build_map_free() method)."""
 
+	hive_source = None
+	"""A RegistryMount.HiveSource named tuple describing the origin of this hive (or None, if not set).
+	This is used to attribute records when two or more hives are mounted together.
+	"""
+
 	def __init__(self, file_object, tolerate_minor_errors = True):
 		self.file_object = file_object
 		self.writable = False
@@ -1425,6 +1430,11 @@ class PrimaryFileTruncated(object):
 
 	cell_map_free = None
 	"""A map of free (unallocated only) cells."""
+
+	hive_source = None
+	"""A RegistryMount.HiveSource named tuple describing the origin of this hive (or None, if not set).
+	This is used to attribute records when two or more hives are mounted together.
+	"""
 
 	def __init__(self, file_object):
 		self.file_object = file_object

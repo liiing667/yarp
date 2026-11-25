@@ -11,10 +11,18 @@ import os
 from hashlib import sha256
 from collections import namedtuple
 
-Key = namedtuple('Key', [ 'rowid', 'is_deleted', 'name', 'classname', 'last_written_timestamp', 'access_bits', 'parent_key_id' ])
-Value = namedtuple('Value', [ 'rowid', 'is_deleted', 'name', 'type', 'data', 'parent_key_id' ])
+Key = namedtuple('Key', [ 'rowid', 'is_deleted', 'name', 'classname', 'last_written_timestamp', 'access_bits', 'parent_key_id', 'hive_path', 'hive_generation' ])
+Value = namedtuple('Value', [ 'rowid', 'is_deleted', 'name', 'type', 'data', 'parent_key_id', 'hive_path', 'hive_generation' ])
 Security = namedtuple('Security', [ 'rowid', 'owner_sid' ])
 HiveInfo = namedtuple('HiveInfo', [ 'last_written_timestamp', 'last_reorganized_timestamp', 'offreg_serialization_timestamp', 'recovered', 'truncated', 'rebuilt' ])
+
+# Columns selected when reading keys and values (the source columns are the last two in each table).
+_KEY_COLUMNS = '`rowid`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id`, `hive_path`, `hive_generation`'
+_VALUE_COLUMNS = '`rowid`, `is_deleted`, `name`, `type`, `data`, `parent_key_id`, `hive_path`, `hive_generation`'
+
+# Columns selected when reading keys and values from a composite (multi-hive) database.
+_COMPOSITE_KEY_COLUMNS = '`rowid`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_rowid`, `hive_path`, `hive_generation`'
+_COMPOSITE_VALUE_COLUMNS = '`rowid`, `is_deleted`, `name`, `type`, `data`, `parent_key_rowid`, `hive_path`, `hive_generation`'
 
 def sqlite3_upper_unicode(string):
 	"""The UPPER()-like function with Unicode support."""
@@ -47,7 +55,9 @@ class YarpDB(object):
 					'`last_written_timestamp` TEXT,'
 					'`access_bits` INTEGER,'
 					'`parent_key_id` TEXT,'
-					'`security_rowid` INTEGER'
+					'`security_rowid` INTEGER,'
+					'`hive_path` TEXT,'
+					'`hive_generation` INTEGER'
 					')')
 	"""Schema for the 'keys' table."""
 
@@ -57,7 +67,9 @@ class YarpDB(object):
 					'`name` TEXT,'
 					'`type` INTEGER,'
 					'`data` BLOB,'
-					'`parent_key_id` TEXT'
+					'`parent_key_id` TEXT,'
+					'`hive_path` TEXT,'
+					'`hive_generation` INTEGER'
 					')')
 	"""Schema for the 'values' table."""
 
@@ -66,11 +78,17 @@ class YarpDB(object):
 					')')
 	"""Schema for the 'security' table."""
 
-	def __init__(self, primary_or_fragment_path, sqlite_path, no_recovery = False):
+	def __init__(self, primary_or_fragment_path, sqlite_path, no_recovery = False, hive_path = None, hive_generation = None):
 		"""Create an sqlite3 database using 'sqlite_path', the database is filled with data from a registry file (primary) or a registry fragment specified by 'primary_or_fragment_path'.
 		An existing database is cleared first. When 'no_recovery' is True, transaction log files are not used to recover a primary file.
 		If 'primary_or_fragment_path' is None, open an existing database and use it.
+		'hive_path' and 'hive_generation' identify the origin of the records; they are stored with
+		every key and value (including rejected/deleted ones) so results stay attributable when
+		databases of multiple hives are combined. When 'hive_path' is None, the primary path is used.
 		"""
+
+		self._hive_path = hive_path if hive_path is not None else primary_or_fragment_path
+		self._hive_generation = hive_generation
 
 		if primary_or_fragment_path is None and os.path.isfile(sqlite_path):
 			# Use the existing database.
@@ -79,10 +97,14 @@ class YarpDB(object):
 			self._log = None
 			self._log1 = None
 			self._log2 = None
+			self._hive_path = hive_path
+			self._hive_generation = hive_generation
 
 			self._db_connection = sqlite3.connect(sqlite_path, check_same_thread = False)
 			self._db_connection.create_function('UPPER_UNICODE', 1, sqlite3_upper_unicode)
 			self.db_cursor = self._db_connection.cursor()
+
+			self._db_migrate()
 
 			return
 
@@ -209,6 +231,27 @@ class YarpDB(object):
 		self.db_cursor.execute('DROP TABLE IF EXISTS `keys`')
 		self.db_cursor.execute('DROP TABLE IF EXISTS `values`')
 		self.db_cursor.execute('DROP TABLE IF EXISTS `security`')
+
+	def _db_migrate(self):
+		"""Upgrade an older database (created without the source columns) in place.
+		New databases already contain the 'hive_path' and 'hive_generation' columns.
+		"""
+
+		self.db_cursor.execute('PRAGMA table_info(`keys`)')
+		key_columns = [ row[1] for row in self.db_cursor.fetchall() ]
+		if 'hive_path' not in key_columns:
+			self.db_cursor.execute('ALTER TABLE `keys` ADD COLUMN `hive_path` TEXT')
+		if 'hive_generation' not in key_columns:
+			self.db_cursor.execute('ALTER TABLE `keys` ADD COLUMN `hive_generation` INTEGER')
+
+		self.db_cursor.execute('PRAGMA table_info(`values`)')
+		value_columns = [ row[1] for row in self.db_cursor.fetchall() ]
+		if 'hive_path' not in value_columns:
+			self.db_cursor.execute('ALTER TABLE `values` ADD COLUMN `hive_path` TEXT')
+		if 'hive_generation' not in value_columns:
+			self.db_cursor.execute('ALTER TABLE `values` ADD COLUMN `hive_generation` INTEGER')
+
+		self._db_connection.commit()
 
 	def _db_init(self):
 		"""Create the tables and indices. Set up basic data about the hive."""
@@ -391,8 +434,8 @@ class YarpDB(object):
 					# Two or more keys are marked as root, do not trust them.
 					self.db_cursor.execute('UPDATE `hive` SET `root_key_id` = ? WHERE `id` = ?', (None, 0))
 
-		self.db_cursor.execute('INSERT OR IGNORE INTO `keys` (`id`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id`, `security_rowid`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
-			(key_id, is_deleted, name, classname, last_written_timestamp, access_bits, parent_key_id, security_rowid))
+		self.db_cursor.execute('INSERT OR IGNORE INTO `keys` (`id`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id`, `security_rowid`, `hive_path`, `hive_generation`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+			(key_id, is_deleted, name, classname, last_written_timestamp, access_bits, parent_key_id, security_rowid, self._hive_path, self._hive_generation))
 
 		try:
 			for value in key.values():
@@ -431,8 +474,8 @@ class YarpDB(object):
 		if is_deleted and self._db_is_reallocated_value_data(value):
 			data_raw = None
 
-		self.db_cursor.execute('INSERT OR IGNORE INTO `values` (`id`, `is_deleted`, `name`, `type`, `data`, `parent_key_id`) VALUES (?, ?, ?, ?, ?, ?)',
-			(value_id, is_deleted, name, type_raw, data_raw, parent_key_id))
+		self.db_cursor.execute('INSERT OR IGNORE INTO `values` (`id`, `is_deleted`, `name`, `type`, `data`, `parent_key_id`, `hive_path`, `hive_generation`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+			(value_id, is_deleted, name, type_raw, data_raw, parent_key_id, self._hive_path, self._hive_generation))
 
 	def _db_process_deleted_data(self):
 		"""Add deleted keys and values from a normal hive or a truncated one to the database."""
@@ -475,11 +518,11 @@ class YarpDB(object):
 	def key(self, key_rowid):
 		"""Get and return a key by its row ID (or None, if not found)."""
 
-		self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id` FROM `keys` WHERE `rowid` = ?', (key_rowid,))
+		self.db_cursor.execute('SELECT ' + _KEY_COLUMNS + ' FROM `keys` WHERE `rowid` = ?', (key_rowid,))
 		results = self.db_cursor.fetchall()
 
 		for result in results:
-			return Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6])
+			return Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6], hive_path = result[7], hive_generation = result[8])
 
 	def subkeys(self, key_rowid):
 		"""Get and yield subkeys of a key with a specific row ID."""
@@ -488,11 +531,11 @@ class YarpDB(object):
 		p = self.db_cursor.fetchone()
 		if p is not None:
 			p = p[0]
-			self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id` FROM `keys` WHERE `parent_key_id` = ? ORDER BY UPPER(`name`) ASC', (p,))
+			self.db_cursor.execute('SELECT ' + _KEY_COLUMNS + ' FROM `keys` WHERE `parent_key_id` = ? ORDER BY UPPER(`name`) ASC', (p,))
 			results = self.db_cursor.fetchall()
 
 			for result in results:
-				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6])
+				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6], hive_path = result[7], hive_generation = result[8])
 
 	def subkeys_with_name(self, key_rowid, name):
 		"""Get and yield subkeys with the given name. This method may yield two or more subkeys if a parent key (specified by its row ID) has deleted subkeys."""
@@ -501,11 +544,11 @@ class YarpDB(object):
 		p = self.db_cursor.fetchone()
 		if p is not None:
 			p = p[0]
-			self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id` FROM `keys` WHERE `parent_key_id` = ? AND UPPER_UNICODE(`name`) = UPPER_UNICODE(?) ORDER BY `is_deleted` ASC', (p, name))
+			self.db_cursor.execute('SELECT ' + _KEY_COLUMNS + ' FROM `keys` WHERE `parent_key_id` = ? AND UPPER_UNICODE(`name`) = UPPER_UNICODE(?) ORDER BY `is_deleted` ASC', (p, name))
 			results = self.db_cursor.fetchall()
 
 			for result in results:
-				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6])
+				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6], hive_path = result[7], hive_generation = result[8])
 
 	def subkeys_unassociated(self):
 		"""Get and yield unassociated (unlinked) subkeys."""
@@ -514,17 +557,17 @@ class YarpDB(object):
 		if root_key is not None:
 			p = root_key.rowid
 
-			self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id` FROM `keys` WHERE `parent_key_id` IS NULL AND `rowid` != ? ORDER BY UPPER(`name`) ASC', (p,))
+			self.db_cursor.execute('SELECT ' + _KEY_COLUMNS + ' FROM `keys` WHERE `parent_key_id` IS NULL AND `rowid` != ? ORDER BY UPPER(`name`) ASC', (p,))
 			results = self.db_cursor.fetchall()
 
 			for result in results:
-				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6])
+				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6], hive_path = result[7], hive_generation = result[8])
 		else:
-			self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id` FROM `keys` WHERE `parent_key_id` IS NULL ORDER BY UPPER(`name`) ASC')
+			self.db_cursor.execute('SELECT ' + _KEY_COLUMNS + ' FROM `keys` WHERE `parent_key_id` IS NULL ORDER BY UPPER(`name`) ASC')
 			results = self.db_cursor.fetchall()
 
 			for result in results:
-				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6])
+				yield Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3], last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6], hive_path = result[7], hive_generation = result[8])
 
 	def security_info(self, key_rowid):
 		"""Return security information for a key with a specific row ID."""
@@ -542,11 +585,11 @@ class YarpDB(object):
 	def value(self, value_rowid):
 		"""Get and return a value by its row ID (or None, if not found)."""
 
-		self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `type`, `data`, `parent_key_id` FROM `values` WHERE `rowid` = ?', (value_rowid,))
+		self.db_cursor.execute('SELECT ' + _VALUE_COLUMNS + ' FROM `values` WHERE `rowid` = ?', (value_rowid,))
 		results = self.db_cursor.fetchall()
 
 		for result in results:
-			return Value(rowid = result[0], is_deleted = result[1], name = result[2], type = result[3], data = result[4], parent_key_id = result[5])
+			return Value(rowid = result[0], is_deleted = result[1], name = result[2], type = result[3], data = result[4], parent_key_id = result[5], hive_path = result[6], hive_generation = result[7])
 
 	def values(self, key_rowid, use_original_order = False):
 		"""Get and yield values of a key with a specific row ID."""
@@ -557,14 +600,14 @@ class YarpDB(object):
 			p = p[0]
 
 			if not use_original_order:
-				self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `type`, `data`, `parent_key_id` FROM `values` WHERE `parent_key_id` = ? ORDER BY UPPER(`name`) ASC', (p,))
+				self.db_cursor.execute('SELECT ' + _VALUE_COLUMNS + ' FROM `values` WHERE `parent_key_id` = ? ORDER BY UPPER(`name`) ASC', (p,))
 			else:
-				self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `type`, `data`, `parent_key_id` FROM `values` WHERE `parent_key_id` = ? ORDER BY UPPER(`id`) ASC', (p,))
+				self.db_cursor.execute('SELECT ' + _VALUE_COLUMNS + ' FROM `values` WHERE `parent_key_id` = ? ORDER BY UPPER(`id`) ASC', (p,))
 
 			results = self.db_cursor.fetchall()
 
 			for result in results:
-				yield Value(rowid = result[0], is_deleted = result[1], name = result[2], type = result[3], data = result[4], parent_key_id = result[5])
+				yield Value(rowid = result[0], is_deleted = result[1], name = result[2], type = result[3], data = result[4], parent_key_id = result[5], hive_path = result[6], hive_generation = result[7])
 
 	def values_unassociated(self):
 		"""Get and yield all unassociated values. For normal hives, this will yield all deleted values; for truncated hives, this will yield all values.
@@ -572,11 +615,11 @@ class YarpDB(object):
 		This method will yield unlinked instances of unassociated values.
 		"""
 
-		self.db_cursor.execute('SELECT `rowid`, `is_deleted`, `name`, `type`, `data`, `parent_key_id` FROM `values` WHERE `parent_key_id` IS NULL ORDER BY UPPER(`name`) ASC')
+		self.db_cursor.execute('SELECT ' + _VALUE_COLUMNS + ' FROM `values` WHERE `parent_key_id` IS NULL ORDER BY UPPER(`name`) ASC')
 		results = self.db_cursor.fetchall()
 
 		for result in results:
-			yield Value(rowid = result[0], is_deleted = result[1], name = result[2], type = result[3], data = result[4], parent_key_id = result[5])
+			yield Value(rowid = result[0], is_deleted = result[1], name = result[2], type = result[3], data = result[4], parent_key_id = result[5], hive_path = result[6], hive_generation = result[7])
 
 	def root_key(self):
 		"""Get and return a root key (or None, if not found)."""
@@ -613,3 +656,258 @@ class YarpDB(object):
 				ts_offreg = int(result[2])
 
 			return HiveInfo(last_written_timestamp = int(result[0]), last_reorganized_timestamp = ts_lr, offreg_serialization_timestamp = ts_offreg, recovered = result[3], truncated = result[4], rebuilt = result[5])
+
+
+class YarpCompositeDB(object):
+	"""A composite sqlite3 database combining two or more registry hives.
+
+	Unlike several YarpDB databases opened separately, this class stores records of all hives in
+	one database. Records sharing the same key/value name (and path) in different hives are kept as
+	separate rows because each row also carries the source of its record: the hive path and the
+	generation (the mount order, starting at 0).
+
+	Single-hive semantics are preserved: within one hive, legitimate duplicate keys (for example,
+	a live key and its deleted copy with the same name) remain separate rows. Records rejected while
+	processing a hive (reallocated deleted records, unassociated records, and so on) are handled by
+	the per-hive converter, and every stored row - read or recovered - carries the same source.
+	"""
+
+	schema_hives = ('CREATE TABLE `hives` ('
+					'`generation` INTEGER PRIMARY KEY,'
+					'`hive_path` TEXT,'
+					'`last_written_timestamp` TEXT,'
+					'`last_reorganized_timestamp` TEXT,'
+					'`offreg_serialization_timestamp` TEXT,'
+					'`root_key_rowid` INTEGER,'
+					'`recovered` NUMERIC,'
+					'`truncated` NUMERIC,'
+					'`rebuilt` NUMERIC'
+					')')
+	"""Schema for the 'hives' table."""
+
+	schema_keys = ('CREATE TABLE `keys` ('
+					'`rowid` INTEGER PRIMARY KEY AUTOINCREMENT,'
+					'`hive_generation` INTEGER,'
+					'`hive_key_id` TEXT,'
+					'`is_deleted` NUMERIC,'
+					'`name` TEXT,'
+					'`classname` TEXT,'
+					'`last_written_timestamp` TEXT,'
+					'`access_bits` INTEGER,'
+					'`parent_key_rowid` INTEGER,'
+					'`hive_path` TEXT'
+					')')
+	"""Schema for the composite 'keys' table. 'hive_key_id' is the key ID within its hive."""
+
+	schema_values = ('CREATE TABLE `values` ('
+					'`rowid` INTEGER PRIMARY KEY AUTOINCREMENT,'
+					'`hive_generation` INTEGER,'
+					'`hive_value_id` INTEGER,'
+					'`is_deleted` NUMERIC,'
+					'`name` TEXT,'
+					'`type` INTEGER,'
+					'`data` BLOB,'
+					'`parent_key_rowid` INTEGER,'
+					'`hive_path` TEXT'
+					')')
+	"""Schema for the composite 'values' table. 'hive_value_id' is the value ID within its hive."""
+
+	def __init__(self, primary_paths, sqlite_path, no_recovery = False):
+		"""Build a composite database at 'sqlite_path' from the hives listed in 'primary_paths'.
+		'primary_paths' is a list of paths; the list index is used as the generation.
+		When 'no_recovery' is True, transaction log files are not used to recover dirty hives.
+		An existing database is cleared first.
+		"""
+
+		self._db_connection = sqlite3.connect(sqlite_path, check_same_thread = False)
+		self._db_connection.create_function('UPPER_UNICODE', 1, sqlite3_upper_unicode)
+		self.db_cursor = self._db_connection.cursor()
+
+		self._db_clear()
+		self.db_cursor.execute(self.schema_hives)
+		self.db_cursor.execute(self.schema_keys)
+		self.db_cursor.execute('CREATE INDEX `keys_idx_name` ON `keys`(`name`)')
+		self.db_cursor.execute('CREATE INDEX `keys_idx_parent` ON `keys`(`parent_key_rowid`)')
+		self.db_cursor.execute('CREATE INDEX `keys_idx_generation` ON `keys`(`hive_generation`)')
+		self.db_cursor.execute(self.schema_values)
+		self.db_cursor.execute('CREATE INDEX `values_idx_name` ON `values`(`name`)')
+		self.db_cursor.execute('CREATE INDEX `values_idx_parent` ON `values`(`parent_key_rowid`)')
+		self.db_cursor.execute('CREATE INDEX `values_idx_generation` ON `values`(`hive_generation`)')
+
+		for generation, primary_path in enumerate(primary_paths):
+			self._add_hive(generation, primary_path, no_recovery)
+
+		self._db_connection.commit()
+
+	def _db_clear(self):
+		"""Remove the tables and indices."""
+
+		self.db_cursor.execute('DROP TABLE IF EXISTS `hives`')
+		self.db_cursor.execute('DROP TABLE IF EXISTS `keys`')
+		self.db_cursor.execute('DROP TABLE IF EXISTS `values`')
+
+	def _add_hive(self, generation, primary_path, no_recovery):
+		"""Convert one hive into a temporary per-hive database and copy its rows with the source."""
+
+		# A per-hive converter handles recovery, truncated hives and rejected records for us.
+		per_hive = YarpDB(primary_path, ':memory:', no_recovery = no_recovery,
+			hive_path = primary_path, hive_generation = generation)
+
+		cur = per_hive.db_cursor
+
+		cur.execute('SELECT `last_written_timestamp`, `last_reorganized_timestamp`, `offreg_serialization_timestamp`, `root_key_id`, `recovered`, `truncated`, `rebuilt` FROM `hive` WHERE `id` = ?', (0,))
+		hive_row = cur.fetchone()
+
+		# Copy keys and remember the mapping from a per-hive key ID to a composite row ID.
+		key_rowid_map = dict()
+
+		cur.execute('SELECT `id`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id`, `hive_path`, `hive_generation` FROM `keys`')
+		keys_rows = cur.fetchall()
+		# Two passes are required because a parent may be stored after its child.
+		for key_row in keys_rows:
+			cur_id, is_deleted, name, classname, ts, access_bits, parent_id, hive_path, hive_generation = key_row
+			self.db_cursor.execute('INSERT INTO `keys` (`hive_generation`, `hive_key_id`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_rowid`, `hive_path`) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)',
+				(generation, cur_id, is_deleted, name, classname, ts, access_bits, hive_path))
+			key_rowid_map[cur_id] = self.db_cursor.lastrowid
+
+		for key_row in keys_rows:
+			cur_id, is_deleted, name, classname, ts, access_bits, parent_id, hive_path, hive_generation = key_row
+			if parent_id is not None and parent_id in key_rowid_map:
+				self.db_cursor.execute('UPDATE `keys` SET `parent_key_rowid` = ? WHERE `rowid` = ?',
+					(key_rowid_map[parent_id], key_rowid_map[cur_id]))
+
+		cur.execute('SELECT `id`, `is_deleted`, `name`, `type`, `data`, `parent_key_id`, `hive_path`, `hive_generation` FROM `values`')
+		for value_row in cur.fetchall():
+			value_id, is_deleted, name, vtype, data, parent_key_id, hive_path, hive_generation = value_row
+			parent_rowid = key_rowid_map.get(parent_key_id)
+			self.db_cursor.execute('INSERT INTO `values` (`hive_generation`, `hive_value_id`, `is_deleted`, `name`, `type`, `data`, `parent_key_rowid`, `hive_path`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+				(generation, value_id, is_deleted, name, vtype, data, parent_rowid, hive_path))
+
+		root_key_rowid = None
+		if hive_row is not None and hive_row[3] is not None:
+			root_key_rowid = key_rowid_map.get(hive_row[3])
+
+		self.db_cursor.execute('INSERT INTO `hives` (`generation`, `hive_path`, `last_written_timestamp`, `last_reorganized_timestamp`, `offreg_serialization_timestamp`, `root_key_rowid`, `recovered`, `truncated`, `rebuilt`) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+			(generation, primary_path, hive_row[0] if hive_row is not None else None,
+				hive_row[1] if hive_row is not None else None,
+				hive_row[2] if hive_row is not None else None,
+				root_key_rowid,
+				hive_row[4] if hive_row is not None else 0,
+				hive_row[5] if hive_row is not None else 0,
+				hive_row[6] if hive_row is not None else 0))
+
+		per_hive.close()
+
+	def _row_to_key(self, result):
+		return Key(rowid = result[0], is_deleted = result[1], name = result[2], classname = result[3],
+			last_written_timestamp = int(result[4]), access_bits = result[5], parent_key_id = result[6],
+			hive_path = result[7], hive_generation = result[8])
+
+	def _row_to_value(self, result):
+		return Value(rowid = result[0], is_deleted = result[1], name = result[2], type = result[3],
+			data = result[4], parent_key_id = result[5], hive_path = result[6], hive_generation = result[7])
+
+	def hives(self):
+		"""Yield HiveInfo-like records with the source (generation and path) for each mounted hive."""
+
+		CompositeHiveInfo = namedtuple('CompositeHiveInfo', HiveInfo._fields + ( 'generation', 'hive_path', 'root_key_rowid' ))
+
+		self.db_cursor.execute('SELECT `generation`, `hive_path`, `last_written_timestamp`, `last_reorganized_timestamp`, `offreg_serialization_timestamp`, `root_key_rowid`, `recovered`, `truncated`, `rebuilt` FROM `hives` ORDER BY `generation` ASC')
+		for result in self.db_cursor.fetchall():
+			generation, hive_path, ts_lw, ts_lr, ts_offreg, root_rowid, recovered, truncated, rebuilt = result
+			yield CompositeHiveInfo(
+				last_written_timestamp = int(ts_lw) if ts_lw is not None else None,
+				last_reorganized_timestamp = int(ts_lr) if ts_lr is not None else None,
+				offreg_serialization_timestamp = int(ts_offreg) if ts_offreg is not None else None,
+				recovered = recovered, truncated = truncated, rebuilt = rebuilt,
+				generation = generation, hive_path = hive_path, root_key_rowid = root_rowid)
+
+	def root_keys(self):
+		"""Yield the root key of every mounted hive, each carrying its source."""
+
+		self.db_cursor.execute('SELECT {} FROM `keys` WHERE `rowid` IN (SELECT `root_key_rowid` FROM `hives` WHERE `root_key_rowid` IS NOT NULL) ORDER BY `hive_generation` ASC'.format(_COMPOSITE_KEY_COLUMNS))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_key(result)
+
+	def key(self, key_rowid):
+		"""Get and return a key by its composite row ID (or None, if not found)."""
+
+		self.db_cursor.execute('SELECT {} FROM `keys` WHERE `rowid` = ?'.format(_COMPOSITE_KEY_COLUMNS), (key_rowid,))
+		result = self.db_cursor.fetchone()
+		if result is not None:
+			return self._row_to_key(result)
+
+	def subkeys(self, key_rowid):
+		"""Yield subkeys of a key with a given composite row ID, ordered by name across all hives."""
+
+		self.db_cursor.execute('SELECT {} FROM `keys` WHERE `parent_key_rowid` = ? ORDER BY UPPER(`name`) ASC, `hive_generation` ASC'.format(_COMPOSITE_KEY_COLUMNS), (key_rowid,))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_key(result)
+
+	def subkeys_with_name(self, key_rowid, name):
+		"""Yield subkeys with the given name. Same-named keys from different hives (and legitimate
+		duplicate keys within one hive) are all returned, each carrying its source."""
+
+		self.db_cursor.execute('SELECT {} FROM `keys` WHERE `parent_key_rowid` = ? AND UPPER_UNICODE(`name`) = UPPER_UNICODE(?) ORDER BY `is_deleted` ASC, `hive_generation` ASC'.format(_COMPOSITE_KEY_COLUMNS), (key_rowid, name))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_key(result)
+
+	def keys_with_name(self, name):
+		"""Yield every key (in every mounted hive) with the given name, each carrying its source."""
+
+		self.db_cursor.execute('SELECT {} FROM `keys` WHERE UPPER_UNICODE(`name`) = UPPER_UNICODE(?) ORDER BY `hive_generation` ASC, `is_deleted` ASC'.format(_COMPOSITE_KEY_COLUMNS), (name,))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_key(result)
+
+	def subkeys_unassociated(self):
+		"""Yield unassociated (unlinked) keys of every mounted hive, each carrying its source."""
+
+		self.db_cursor.execute('SELECT {} FROM `keys` k WHERE k.`parent_key_rowid` IS NULL AND k.`rowid` != (SELECT `root_key_rowid` FROM `hives` h WHERE h.`generation` = k.`hive_generation`) ORDER BY UPPER(k.`name`) ASC, k.`hive_generation` ASC'.format(_COMPOSITE_KEY_COLUMNS))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_key(result)
+
+	def value(self, value_rowid):
+		"""Get and return a value by its composite row ID (or None, if not found)."""
+
+		self.db_cursor.execute('SELECT {} FROM `values` WHERE `rowid` = ?'.format(_COMPOSITE_VALUE_COLUMNS), (value_rowid,))
+		result = self.db_cursor.fetchone()
+		if result is not None:
+			return self._row_to_value(result)
+
+	def values(self, key_rowid, use_original_order = False):
+		"""Yield values of a key with a given composite row ID."""
+
+		if not use_original_order:
+			query = 'SELECT {} FROM `values` WHERE `parent_key_rowid` = ? ORDER BY UPPER(`name`) ASC, `hive_generation` ASC'.format(_COMPOSITE_VALUE_COLUMNS)
+		else:
+			query = 'SELECT {} FROM `values` WHERE `parent_key_rowid` = ? ORDER BY `hive_value_id` ASC'.format(_COMPOSITE_VALUE_COLUMNS)
+
+		self.db_cursor.execute(query, (key_rowid,))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_value(result)
+
+	def values_with_name(self, name):
+		"""Yield every value (in every mounted hive) with the given name, each carrying its source."""
+
+		self.db_cursor.execute('SELECT {} FROM `values` WHERE UPPER_UNICODE(`name`) = UPPER_UNICODE(?) ORDER BY `hive_generation` ASC, `is_deleted` ASC'.format(_COMPOSITE_VALUE_COLUMNS), (name,))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_value(result)
+
+	def values_unassociated(self):
+		"""Yield unassociated values of every mounted hive, each carrying its source."""
+
+		self.db_cursor.execute('SELECT {} FROM `values` WHERE `parent_key_rowid` IS NULL ORDER BY UPPER(`name`) ASC, `hive_generation` ASC'.format(_COMPOSITE_VALUE_COLUMNS))
+		for result in self.db_cursor.fetchall():
+			yield self._row_to_value(result)
+
+	def close(self):
+		"""Commit and close the database."""
+
+		self._db_connection.commit()
+		self._db_connection.close()
+
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *args):
+		self.close()

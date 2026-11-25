@@ -3395,3 +3395,155 @@ def test_remnant_bytes():
 	assert c == 3 and len(l) == 0 and c_v == 4
 
 	f.close()
+
+
+def test_registry_mount_sources():
+	"""Multiple hives mounted together: every record carries its source (hive path and generation)."""
+
+	if sys.version_info.major != 3:
+		pytest.skip()
+
+	from yarp import RegistryMount
+
+	hive_paths = [ hive_sqlite, hive_dupname_sqlite, hive_deleted_data ]
+
+	with RegistryMount.RegistryMount() as mount:
+		for generation, hive_path in enumerate(hive_paths):
+			mounted = mount.mount(hive_path, no_recovery = True)
+			assert mounted.generation == generation
+			assert mounted.path == hive_path
+
+		assert mount.generations() == [ 0, 1, 2 ]
+		assert len(mount) == 3
+
+		# Root keys and everything reachable from them carry the source of their hive.
+		for generation, root_key in enumerate(mount.root_keys()):
+			source = root_key.source()
+			assert source is not None
+			assert source.generation == generation
+			assert source.path == hive_paths[generation]
+
+			for subkey in root_key.subkeys():
+				assert subkey.source() == source
+				for value in subkey.values():
+					assert value.source() == source
+
+		# find_key() yields one attributable record per hive (no cross-hive collapsing).
+		root_hits = list(mount.find_key('\\'))
+		assert len(root_hits) == len(hive_paths)
+		assert sorted(key.source().generation for key in root_hits) == [ 0, 1, 2 ]
+
+		# Records read from a recovery scanner (including rejected/deleted ones) keep the source.
+		mounted_deleted = list(mount.hives())[2]
+		mounted_deleted.hive.walk_everywhere()
+		scanner = RegistryRecover.Scanner(mounted_deleted.hive)
+		recovered_count = 0
+		for item in scanner.scan():
+			if isinstance(item, (Registry.RegistryKey, Registry.RegistryValue)):
+				assert item.source() is not None
+				assert item.source().generation == 2
+				assert item.source().path == hive_deleted_data
+				recovered_count += 1
+
+		assert recovered_count > 0
+
+		# Mounting a missing file is rejected with a MountException.
+		with pytest.raises(RegistryMount.MountException):
+			mount.mount(path.join(HIVES_DIR, 'no_such_hive'))
+
+	# A standalone (not mounted) hive has no source: single-hive semantics are unchanged.
+	with open(hive_sqlite, 'rb') as f:
+		hive = Registry.RegistryHive(f)
+		assert hive.root_key().source() is None
+
+
+def test_registry_mount_same_hive_twice():
+	"""The same hive mounted twice: same-named keys stay attributable via the generation."""
+
+	if sys.version_info.major != 3:
+		pytest.skip()
+
+	from yarp import RegistryMount
+
+	with RegistryMount.RegistryMount() as mount:
+		mount.mount(hive_sqlite)
+		mount.mount(hive_sqlite)
+
+		root_keys = list(mount.root_keys())
+		assert len(root_keys) == 2
+		assert [ key.source().generation for key in root_keys ] == [ 0, 1 ]
+		assert all(key.source().path == hive_sqlite for key in root_keys)
+
+		for root_key in root_keys:
+			generation = root_key.source().generation
+			for subkey in root_key.subkeys():
+				assert subkey.source().generation == generation
+
+
+def test_composite_db_sources():
+	"""The composite database keeps same-named keys of different hives and stores their sources."""
+
+	if sys.version_info.major != 3:
+		pytest.skip()
+
+	hive_paths = [ hive_sqlite, hive_dupname_sqlite, hive_deleted_data ]
+
+	with RegistrySqlite.YarpCompositeDB(hive_paths, ':memory:', no_recovery = True) as cdb:
+		hives = list(cdb.hives())
+		assert len(hives) == 3
+		assert [ hive.generation for hive in hives ] == [ 0, 1, 2 ]
+		assert [ hive.hive_path for hive in hives ] == hive_paths
+
+		root_keys = list(cdb.root_keys())
+		assert len(root_keys) == 3
+		for generation, key in enumerate(root_keys):
+			assert key.hive_generation == generation
+			assert key.hive_path == hive_paths[generation]
+
+		# Every stored row (read or rejected) carries a source.
+		cdb.db_cursor.execute('SELECT COUNT(*) FROM `keys` WHERE `hive_path` IS NULL OR `hive_generation` IS NULL')
+		assert cdb.db_cursor.fetchone()[0] == 0
+		cdb.db_cursor.execute('SELECT COUNT(*) FROM `values` WHERE `hive_path` IS NULL OR `hive_generation` IS NULL')
+		assert cdb.db_cursor.fetchone()[0] == 0
+
+		# Unassociated (rejected/unlinked) records keep their source as well.
+		for key in cdb.subkeys_unassociated():
+			assert key.hive_path is not None and key.hive_generation is not None
+		for value in cdb.values_unassociated():
+			assert value.hive_path is not None and value.hive_generation is not None
+
+		# Legitimate duplicate keys within one hive are preserved (the DupNameHive case).
+		dup_root = next(key for key in root_keys if key.hive_path == hive_dupname_sqlite)
+		ccc_keys = list(cdb.subkeys_with_name(dup_root.rowid, 'cCC'))
+		assert len(ccc_keys) == 2
+		assert all(key.hive_generation == dup_root.hive_generation for key in ccc_keys)
+		assert sorted(key.is_deleted for key in ccc_keys) == [ 0, 1 ]
+
+	# The same hive combined twice: rows are distinguished by generation, never collapsed.
+	with RegistrySqlite.YarpCompositeDB([ hive_sqlite, hive_sqlite ], ':memory:') as cdb:
+		root_keys = list(cdb.root_keys())
+		assert len(root_keys) == 2
+		root_name = root_keys[0].name
+		same_name = list(cdb.keys_with_name(root_name))
+		assert len(same_name) == 2
+		assert sorted(key.hive_generation for key in same_name) == [ 0, 1 ]
+		assert all(key.hive_path == hive_sqlite for key in same_name)
+
+
+def test_single_hive_db_source_columns():
+	"""A single-hive database still works and exposes the source columns."""
+
+	if sys.version_info.major != 3:
+		pytest.skip()
+
+	with RegistrySqlite.YarpDB(hive_sqlite, ':memory:') as hdb:
+		root = hdb.root_key()
+		assert root.hive_path == hive_sqlite
+		assert root.hive_generation is None
+
+	with RegistrySqlite.YarpDB(hive_sqlite, ':memory:', hive_path = 'mounted/SYSTEM', hive_generation = 4) as hdb:
+		root = hdb.root_key()
+		assert root.hive_path == 'mounted/SYSTEM'
+		assert root.hive_generation == 4
+		for subkey in hdb.subkeys(root.rowid):
+			assert subkey.hive_generation == 4

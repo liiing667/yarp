@@ -1,5 +1,13 @@
 Version: 1.0.33
 
+yarp: new RegistryMount module to mount (combine) multiple registry hives; records of composite
+queries carry a source record (the hive path and the mount generation), so same-named keys of
+different hives stay attributable to the original file; single-hive queries and legitimate
+duplicate keys are unchanged; readable and rejected records share the same source record.
+Registry, RegistryFile: keys and values expose their source via the source() method, the primary
+file objects carry an optional hive_source attribute.
+RegistrySqlite: keys and values store the hive path and generation columns (old databases are
+migrated automatically), new YarpCompositeDB class for multi-hive databases.
 yarp-print: print deleted values correctly when dealing with truncated hives, print remnant value data (having no corresponding deleted key value).
 RegistryRecover: handle remnant value data.
 

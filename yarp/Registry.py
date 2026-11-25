@@ -843,6 +843,13 @@ class RegistryKey(object):
 
 		return ' | '.join(flags_str_list)
 
+	def source(self):
+		"""Return the source record (a RegistryMount.HiveSource named tuple) of this key, or None.
+		The source record identifies the hive (by its path and generation) the key was read from.
+		"""
+
+		return getattr(self.registry_file, 'hive_source', None)
+
 	def __str__(self):
 		return 'RegistryKey, name: {}, subkeys: {}, values: {}'.format(self.name(), self.subkeys_count(), self.values_count())
 
@@ -1049,6 +1056,13 @@ class RegistryValue(object):
 			return VALUE_FLAG_TOMBSTONE
 
 		return
+
+	def source(self):
+		"""Return the source record (a RegistryMount.HiveSource named tuple) of this value, or None.
+		The source record identifies the hive (by its path and generation) the value was read from.
+		"""
+
+		return getattr(self.registry_file, 'hive_source', None)
 
 	def __str__(self):
 		name = self.name()
