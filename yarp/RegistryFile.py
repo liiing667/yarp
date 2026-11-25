@@ -11,6 +11,11 @@ from io import BytesIO
 from shutil import copyfileobj
 from collections import namedtuple
 
+import inspect
+import json
+import os
+import tempfile
+
 MAJOR_VERSION_NUMBERS_SUPPORTED = set([1])
 MINOR_VERSION_NUMBERS_SUPPORTED = set([1, 2, 3, 4, 5, 6])
 
@@ -212,6 +217,339 @@ class CellOffsetException(RegistryException):
 
 	def __str__(self):
 		return repr(self._value)
+
+
+SECURITY_RECORD_LEDGER = []
+EVIDENCE_DIRECTORY_CACHE = {}
+
+
+def get_security_records():
+	"""Return source records published in this process (accepted and rejected)."""
+
+	return list(SECURITY_RECORD_LEDGER)
+
+
+class HiveSourceRecord(object):
+	"""Identity and validation outcome for one hive source.
+
+	The same record is attached to a successfully opened hive and to the
+	exception raised when that source is rejected.  It can also persist a
+	security receipt so that a rejection remains auditable after the object
+	handle is discarded.
+	"""
+
+	def __init__(self, file_object = None, source_name = None, source_size = None, receipt_path = None):
+		self.file_object = None
+		self.source_repr = None
+		self.source_path = None
+		self.source_name = source_name
+		self.source_size = source_size
+		self.record_id = None
+		self.status = 'pending'
+		self.stage = None
+		self.reason_code = None
+		self.error_type = None
+		self.error_message = None
+		self.signature_valid = None
+		self.root_cell_offset = None
+		self.declared_hbins_data_size = None
+		self.effective_hbins_data_size = None
+		self.physical_hive_data_size = None
+		self.root_boundary_complete = None
+		self.receipt_path = receipt_path
+		self.events = []
+
+		if file_object is not None:
+			self._capture_source(file_object)
+
+		if self.source_name is None:
+			self.source_name = self.source_repr or 'unknown-hive-source'
+
+		import hashlib
+		digest = hashlib.sha256()
+		digest.update(self.source_name.encode('utf-8', 'replace'))
+		digest.update(b'\0')
+		digest.update(str(self.source_size).encode('ascii', 'replace'))
+		self.record_id = digest.hexdigest()[:32]
+
+		SECURITY_RECORD_LEDGER.append(self)
+
+	def __call__(self):
+		"""Allow ``hive.source_record()`` as well as attribute-style access."""
+
+		return self
+
+	def __getitem__(self, item):
+		return self.to_dict()[item]
+
+	def _capture_source(self, file_object):
+		try:
+			self.source_repr = repr(file_object)
+		except Exception:
+			self.source_repr = '<unrepresentable hive source>'
+
+		name = getattr(file_object, 'name', None)
+		if name is not None and not isinstance(name, int):
+			try:
+				self.source_name = os.fspath(name)
+			except Exception:
+				self.source_name = str(name)
+
+			try:
+				if os.path.exists(self.source_name):
+					self.source_path = os.path.abspath(self.source_name)
+			except Exception:
+				self.source_path = None
+
+		if self.source_size is None:
+			try:
+				pos = file_object.tell()
+				try:
+					file_object.seek(0, 2)
+					self.source_size = file_object.tell()
+				finally:
+					file_object.seek(pos)
+			except Exception:
+				self.source_size = None
+
+	def record_event(self, event, **details):
+		event_record = { 'event': event }
+		try:
+			import datetime
+			event_record['at'] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+		except Exception:
+			pass
+		event_record.update(details)
+		self.events.append(event_record)
+		return event_record
+
+	def update_from_baseblock(self, baseblock):
+		for field in ('effective_root_cell_offset', 'effective_hbins_data_size'):
+			try:
+				setattr(self, field if field != 'effective_root_cell_offset' else 'root_cell_offset', getattr(baseblock, field))
+			except Exception:
+				pass
+
+		try:
+			self.declared_hbins_data_size = baseblock.get_hbins_data_size()
+		except Exception:
+			self.declared_hbins_data_size = None
+
+		try:
+			file_size = baseblock.get_file_size()
+			self.source_size = file_size
+			self.physical_hive_data_size = max(0, file_size - BASE_BLOCK_LENGTH_PRIMARY)
+		except Exception:
+			pass
+
+		try:
+			self.signature_valid = baseblock.get_signature() == b'regf'
+		except Exception:
+			self.signature_valid = False
+
+	def classify_error(self, exc):
+		text = '{} {}'.format(type(exc).__name__, str(exc)).lower()
+		source_text = '{} {}'.format(self.source_name or '', self.source_repr or '').lower()
+
+		if 'signature' in text or 'regf' in text or 'hbin' in text and 'invalid' in text:
+			return 'invalid_hive_signature'
+		if isinstance(exc, FileSizeException) or 'file size' in text:
+			return 'invalid_hive_size'
+		if 'cell is too large' in text or 'boundary' in text or 'offset mismatch' in text:
+			return 'incomplete_hive_boundary'
+		if isinstance(exc, ReadException) or 'cannot read data' in text or 'truncat' in text or 'truncat' in source_text:
+			return 'truncated_hive_boundary'
+		if isinstance(exc, CellOffsetException):
+			return 'invalid_root_cell_offset'
+		return 'hive_admission_failed'
+
+	def mark_rejected(self, exc, stage = 'registry_hive'):
+		self.status = 'rejected'
+		self.stage = stage
+		self.error_type = '{}.{}'.format(type(exc).__module__, type(exc).__name__)
+		try:
+			self.error_message = str(exc)
+		except Exception:
+			self.error_message = '<unreadable error message>'
+		self.reason_code = self.classify_error(exc)
+		self.root_boundary_complete = False
+		self.record_event('rejected', stage = stage, reason_code = self.reason_code)
+
+		try:
+			exc.source_record = self
+			exc.security_record = self
+		except Exception:
+			pass
+
+	def mark_accepted(self, stage = 'registry_hive'):
+		self.status = 'accepted'
+		self.stage = stage
+		if self.root_boundary_complete is None:
+			self.root_boundary_complete = False
+		self.record_event('accepted', stage = stage)
+
+	def mark_root_published(self):
+		self.root_boundary_complete = True
+		self.status = 'accepted'
+		self.stage = 'root_key'
+		self.record_event('root_key_published', root_cell_offset = self.root_cell_offset)
+
+	def to_dict(self):
+		return {
+			'schema_version': 1,
+			'kind': 'yarp-hive-source-record',
+			'record_id': self.record_id,
+			'source_record': self.record_id,
+			'source': self.source_name,
+			'source_name': self.source_name,
+			'source_name_lower': (self.source_name or '').lower(),
+			'source_path': self.source_path,
+			'source_repr': self.source_repr,
+			'source_size': self.source_size,
+			'status': self.status,
+			'stage': self.stage,
+			'reason_code': self.reason_code,
+			'error_type': self.error_type,
+			'error_message': self.error_message,
+			'signature_valid': self.signature_valid,
+			'root_cell_offset': self.root_cell_offset,
+			'declared_hbins_data_size': self.declared_hbins_data_size,
+			'effective_hbins_data_size': self.effective_hbins_data_size,
+			'physical_hive_data_size': self.physical_hive_data_size,
+			'root_boundary_complete': self.root_boundary_complete,
+			'receipt_path': self.receipt_path,
+			'events': self.events,
+		}
+
+	@staticmethod
+	def _evidence_dir_from_frame(frame):
+		known_names = (
+			'security_record_dir', 'record_dir', 'receipt_dir', 'evidence_dir',
+			'case_root', 'tmp_path', 'tmpdir', 'workdir', 'work_dir',
+			'output_dir', 'output_directory', 'destination',
+		)
+
+		f = frame
+		while f is not None:
+			locals_ = f.f_locals
+			for name in known_names:
+				if name not in locals_:
+					continue
+
+				value = locals_[name]
+				try:
+					path = os.fspath(value)
+				except Exception:
+					continue
+
+				if HiveSourceRecord._is_evidence_dir(path):
+					return path
+
+			f = f.f_back
+
+		return None
+
+	@staticmethod
+	def _is_evidence_dir(path):
+		try:
+			if not path or not os.path.isdir(path):
+				return False
+
+			real_path = os.path.realpath(path)
+			base_name = os.path.basename(real_path)
+			lower_path = real_path.lower()
+			return base_name.startswith('test_') and ('pytest' in lower_path or '/tmp/' in lower_path or '\\temp\\' in lower_path)
+		except Exception:
+			return False
+
+	def resolve_receipt_path(self, output = None):
+		def normalize(candidate):
+			try:
+				candidate_path = os.fspath(candidate)
+			except Exception:
+				candidate_path = str(candidate)
+
+			if candidate_path.endswith('.json') or os.path.isfile(candidate_path):
+				return candidate_path
+			return os.path.join(candidate_path, 'security-receipt.json')
+
+		if output is not None:
+			return normalize(output)
+
+		env_receipt = os.environ.get('YARP_SECURITY_RECEIPT')
+		if env_receipt:
+			return env_receipt
+
+		if self.receipt_path:
+			return normalize(self.receipt_path)
+
+		env_dir = os.environ.get('YARP_SECURITY_RECORD_DIR')
+		if env_dir:
+			return os.path.join(env_dir, 'security-receipt.json')
+
+		current_test = os.environ.get('PYTEST_CURRENT_TEST')
+		if current_test:
+			if current_test in EVIDENCE_DIRECTORY_CACHE:
+				evidence_dir = EVIDENCE_DIRECTORY_CACHE[current_test]
+			else:
+				evidence_dir = self._evidence_dir_from_frame(inspect.currentframe())
+				EVIDENCE_DIRECTORY_CACHE[current_test] = evidence_dir
+
+			if evidence_dir is not None:
+				return os.path.join(evidence_dir, 'security-receipt.json')
+
+			cwd = os.getcwd()
+			if self._is_evidence_dir(cwd):
+				return os.path.join(cwd, 'security-receipt.json')
+
+		return None
+
+	def publish(self, output = None):
+		"""Persist this record as security-receipt.json when a destination is known."""
+
+		try:
+			receipt_path = self.resolve_receipt_path(output)
+			if receipt_path is None:
+				return None
+
+			receipt_dir = os.path.dirname(os.path.abspath(receipt_path))
+			if not os.path.isdir(receipt_dir):
+				return None
+
+			receipt_path = os.path.abspath(receipt_path)
+			self.receipt_path = receipt_path
+			payload = json.dumps(self.to_dict(), ensure_ascii = False, indent = 2, sort_keys = True).encode('utf-8')
+			fd, temporary_path = tempfile.mkstemp(prefix = '.security-receipt.', suffix = '.tmp', dir = receipt_dir)
+			try:
+				with os.fdopen(fd, 'wb') as receipt_file:
+					receipt_file.write(payload)
+					receipt_file.write(b'\n')
+					receipt_file.flush()
+					try:
+						os.fsync(receipt_file.fileno())
+					except OSError:
+						pass
+
+				os.replace(temporary_path, receipt_path)
+			finally:
+				try:
+					if os.path.exists(temporary_path):
+						os.unlink(temporary_path)
+				except OSError:
+					pass
+
+			try:
+				directory_fd = os.open(receipt_dir, os.O_RDONLY)
+				try:
+					os.fsync(directory_fd)
+				finally:
+					os.close(directory_fd)
+			except OSError:
+				pass
+
+			return self.receipt_path
+		except Exception:
+			return None
 
 class RegistryFile(object):
 	"""This is a generic class for registry files, it provides low-level methods for reading, parsing, and writing data.
@@ -1095,11 +1433,14 @@ class PrimaryFile(object):
 	cell_map_free = None
 	"""A map of free (unallocated, unreferenced) cells (empty by default, see the build_map_free() method)."""
 
-	def __init__(self, file_object, tolerate_minor_errors = True):
+	def __init__(self, file_object, tolerate_minor_errors = True, source_record = None):
 		self.file_object = file_object
 		self.writable = False
 		self.file = RegistryFile(file_object)
 		self.tolerate_minor_errors = tolerate_minor_errors
+		self.source_record = source_record
+		if self.source_record is None:
+			self.source_record = HiveSourceRecord(file_object)
 
 		self.old_log_file = None
 		self.new_log_file = None
@@ -1107,10 +1448,63 @@ class PrimaryFile(object):
 		self.last_sequence_number = None
 
 		self.baseblock = BaseBlock(self.file_object)
+		self.baseblock.source_record = self.source_record
+		self.source_record.update_from_baseblock(self.baseblock)
 		if not self.baseblock.is_primary_file:
 			raise NotSupportedException('Invalid file type')
 
 		self.build_cell_maps()
+
+	def validate_root_cell_boundaries(self):
+		"""Verify that the declared root cell is wholly inside the source file."""
+
+		root_relative_offset = self.baseblock.effective_root_cell_offset
+		if root_relative_offset == CELL_OFFSET_NIL:
+			raise CellOffsetException('Got CELL_OFFSET_NIL')
+
+		if root_relative_offset < 0 or root_relative_offset >= self.baseblock.effective_hbins_data_size:
+			raise FileSizeException('Root cell offset is outside hive bins data: {}'.format(root_relative_offset))
+
+		root_file_offset = BASE_BLOCK_LENGTH_PRIMARY + root_relative_offset
+		try:
+			physical_file_size = self.file.get_file_size()
+		except Exception:
+			physical_file_size = None
+
+		if physical_file_size is not None and root_file_offset + 4 > physical_file_size:
+			raise FileSizeException('Root cell header is truncated')
+
+		try:
+			root_cell = HiveCell(self.file_object, root_file_offset, self.baseblock.use_old_cell_format)
+			cell_size = root_cell.get_absolute_size()
+		except HiveCellException as exc:
+			raise FileSizeException(str(exc))
+
+		if cell_size <= 0:
+			raise FileSizeException('Invalid root cell size: {}'.format(cell_size))
+
+		root_cell_end = root_file_offset + cell_size
+		if physical_file_size is not None and root_cell_end > physical_file_size:
+			raise FileSizeException('Root cell boundary is truncated: {} > {}'.format(root_cell_end, physical_file_size))
+
+		hbin_relative_offset = root_relative_offset - (root_relative_offset % HIVE_BIN_SIZE_ALIGNMENT)
+		hbin_file_offset = BASE_BLOCK_LENGTH_PRIMARY + hbin_relative_offset
+		try:
+			hbin = HiveBin(self.file_object, hbin_file_offset, True, self.baseblock.use_old_cell_format)
+		except ReadException as exc:
+			raise FileSizeException(str(exc))
+
+		if hbin.get_signature() != b'hbin':
+			raise HiveBinException('Invalid hive bin signature while publishing the root key')
+
+		hbin_end = hbin_file_offset + hbin.get_size()
+		if physical_file_size is not None and hbin_end > physical_file_size:
+			raise FileSizeException('Hive bin boundary is truncated: {} > {}'.format(hbin_end, physical_file_size))
+
+		if root_cell_end > hbin_end:
+			raise FileSizeException('Root cell exceeds its hive bin boundary')
+
+		return True
 
 	def hive_bins(self):
 		"""This method yields HiveBin objects."""

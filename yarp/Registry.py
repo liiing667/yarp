@@ -53,6 +53,14 @@ RegistryRecords.KEY_IS_SUPERSEDE_TREE: 'IsSupersedeTree',
 KEY_FLAG_INHERIT_CLASS = 'InheritClass'
 VALUE_FLAG_TOMBSTONE = 'IsTombstone'
 
+SourceRecord = RegistryFile.HiveSourceRecord
+
+
+def get_security_records():
+	"""Return all source records created by this parser process."""
+
+	return RegistryFile.get_security_records()
+
 AutoRecoveryResult = namedtuple('AutoRecoveryResult', [ 'recovered', 'is_new_log', 'file_objects' ])
 
 class WalkException(RegistryException):
@@ -203,15 +211,63 @@ class RegistryHive(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object, tolerate_minor_errors = True):
-		self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+	source_record = None
+	"""The source identity and validation/audit record for this hive."""
+
+	def __init__(self, file_object, tolerate_minor_errors = True, security_record_path = None, source_record = None):
+		if source_record is not None:
+			self.source_record = source_record
+		else:
+			self.source_record = RegistryFile.HiveSourceRecord(file_object, receipt_path = security_record_path)
+
+		self.source_record.record_event('registry_hive_open_started', tolerate_minor_errors = tolerate_minor_errors)
+
+		try:
+			self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors, self.source_record)
+		except Exception as exc:
+			self.source_record.mark_rejected(exc, 'RegistryHive.__init__')
+			self.source_record.publish(security_record_path)
+			raise
+
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		self.security_record = self.source_record
+		self.source_record.mark_accepted('RegistryHive.__init__')
+		self.source_record.publish(security_record_path)
 
 	def root_key(self):
 		"""Get and return a root key node (a RegistryKey object)."""
 
-		return RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+		try:
+			root_buf = self.registry_file.get_root_cell()
+			self.registry_file.validate_root_cell_boundaries()
+			root_key = RegistryKey(self.registry_file, root_buf, 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+			# Validate the fixed node, key name and its wire boundary before publishing it.
+			root_key.name()
+			root_key.source_record = self.source_record
+		except Exception as exc:
+			self.source_record.mark_rejected(exc, 'RegistryHive.root_key')
+			self.source_record.publish()
+			raise
+
+		self.source_record.mark_root_published()
+		self.source_record.publish()
+		return root_key
+
+	def get_source_record(self):
+		"""Return the source record shared by accepted reads and rejections."""
+
+		return self.source_record
+
+	def get_security_record(self):
+		"""Compatibility alias for get_source_record()."""
+
+		return self.source_record
+
+	def RootKey(self):
+		"""Compatibility alias for callers using the structure/concept name."""
+
+		return self.root_key()
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
