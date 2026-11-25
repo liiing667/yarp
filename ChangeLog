@@ -1,3 +1,12 @@
+Version: 1.0.34
+
+RegistryFile: bind the sequence numbers and the identity of dirty pages when recovering a primary file using transaction log files.
+RegistryFile: reject a transaction log file when its sequence numbers do not belong to the sequence window of a dirty primary file (or to the chain of applied log entries), so that stale transaction log files (e.g., from an older generation of a primary file) are not replayed.
+RegistryFile: reject a dirty page when its location does not belong to the hive bins data of a primary file being recovered.
+RegistryFile: keep the same source record (the old_log_file and new_log_file attributes) for read and rejected transaction log files.
+
+---
+
 Version: 1.0.33
 
 yarp-print: print deleted values correctly when dealing with truncated hives, print remnant value data (having no corresponding deleted key value).

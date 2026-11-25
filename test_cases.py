@@ -6,6 +6,7 @@
 import pytest
 import sys
 import tarfile
+import struct
 from io import BytesIO
 from os import path, remove
 from hashlib import md5
@@ -418,6 +419,96 @@ def test_recovery_not_required():
 
 		with pytest.raises(RegistryFile.RecoveryException):
 			hive.recover_new(dummy)
+
+def test_recovery_sequence_and_dirty_page_binding():
+	def patch_baseblock_sequence_numbers(data, sequence_number):
+		# Set both sequence numbers of a registry file to a given value and fix the checksum.
+		buf = BytesIO(data)
+		reg_file = RegistryFile.RegistryFile(buf)
+		reg_file.write_uint32(4, sequence_number)
+		reg_file.write_uint32(8, sequence_number)
+		buf.seek(0)
+		baseblock = RegistryFile.BaseBlock(buf, True)
+		baseblock.update_checksum()
+		buf.seek(0)
+		return buf.read()
+
+	def patch_first_dirty_page_offset(data, new_offset):
+		# Patch the offset of the first dirty page reference of the first log entry, fix the hashes.
+		b = bytearray(data)
+		pos = 512 # BASE_BLOCK_LENGTH_LOG
+		assert b[pos : pos + 4] == b'HvLE'
+		struct.pack_into('<L', b, pos + 40, new_offset)
+		size = struct.unpack('<L', b[pos + 4 : pos + 8])[0]
+		hash_1 = RegistryFile.Marvin32(bytearray(b[pos + 40 : pos + size]))
+		struct.pack_into('<Q', b, pos + 24, hash_1)
+		hash_2 = RegistryFile.Marvin32(bytearray(b[pos : pos + 32]))
+		struct.pack_into('<Q', b, pos + 32, hash_2)
+		return bytes(b)
+
+	with open(hive_dirty_new2, 'rb') as primary, open(hive_dirty_new2_log2, 'rb') as log2:
+		primary_data = primary.read()
+		log2_data = log2.read()
+
+	# A log file from another generation of this primary file (sequence numbers are too new) must not be applied.
+	stale_log_data = patch_baseblock_sequence_numbers(log2_data, 100)
+
+	hive = Registry.RegistryHive(BytesIO(primary_data))
+	with pytest.raises(RegistryFile.NotEligibleException):
+		hive.recover_new(BytesIO(stale_log_data))
+
+	assert hive.registry_file.log_apply_count == 0
+	assert hive.registry_file.new_log_file is None # The rejected log file does not clobber the source record.
+
+	# A legitimate log file (its sequence number is within the window of a dirty primary file) is applied.
+	hive = Registry.RegistryHive(BytesIO(primary_data))
+	t = hive.recover_new(BytesIO(log2_data))
+	assert hive.registry_file.log_apply_count == 1
+	assert hive.registry_file.last_sequence_number == 5
+	assert hive.registry_file.new_log_file is not None
+
+	# A second log file must continue the chain of applied log entries exactly.
+	gap_log_data = patch_baseblock_sequence_numbers(log2_data, 8)
+	applied_log_source = hive.registry_file.new_log_file
+
+	with pytest.raises(RegistryFile.RecoveryException):
+		hive.registry_file.apply_new_log_file(BytesIO(gap_log_data))
+
+	assert hive.registry_file.new_log_file is applied_log_source # The same source record is kept.
+
+	# A dirty page outside of the hive bins data must not be applied.
+	evil_log_data = patch_first_dirty_page_offset(log2_data, 24576) # The hive bins data size is 20480.
+
+	hive = Registry.RegistryHive(BytesIO(primary_data))
+	with pytest.raises(RegistryFile.DirtyPageException):
+		hive.recover_new(BytesIO(evil_log_data))
+
+	# A dirty page with an unaligned offset must not be applied.
+	evil_log_data = patch_first_dirty_page_offset(log2_data, 123)
+
+	hive = Registry.RegistryHive(BytesIO(primary_data))
+	with pytest.raises(RegistryFile.DirtyPageException):
+		hive.recover_new(BytesIO(evil_log_data))
+
+	# A log file in the old format from an older generation of this primary file must not be applied.
+	with open(hive_dirty_old, 'rb') as primary, open(hive_dirty_old_log, 'rb') as log:
+		primary_data = primary.read()
+		log_data = log.read()
+
+	stale_log_data = patch_baseblock_sequence_numbers(log_data, 1)
+
+	hive = Registry.RegistryHive(BytesIO(primary_data))
+	with pytest.raises(RegistryFile.NotEligibleException):
+		hive.recover_old(BytesIO(stale_log_data))
+
+	assert hive.registry_file.log_apply_count == 0
+	assert hive.registry_file.old_log_file is None # The rejected log file does not clobber the source record.
+
+	# A legitimate log file in the old format is applied.
+	hive = Registry.RegistryHive(BytesIO(primary_data))
+	hive.recover_old(BytesIO(log_data))
+	assert hive.registry_file.log_apply_count == 1
+	assert hive.registry_file.old_log_file is not None
 
 def test_unicode():
 	with open(hive_unicode, 'rb') as f:

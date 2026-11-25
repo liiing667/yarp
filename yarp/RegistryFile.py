@@ -169,7 +169,7 @@ class DirtyVectorException(RegistryException):
 		return repr(self._value)
 
 class DirtyPageException(RegistryException):
-	"""This exception is raised when a dirty page is invalid (truncated)."""
+	"""This exception is raised when a dirty page is invalid (truncated or not belonging to a primary file)."""
 
 	def __init__(self, value):
 		self._value = value
@@ -1278,6 +1278,22 @@ class PrimaryFile(object):
 		# Close the file object.
 		baseblock_object.close()
 
+	def validate_dirty_page(self, dirty_page, hbins_data_size):
+		"""Check whether or not a dirty page belongs to this primary file (this binds the identity of a dirty page).
+		If not, an exception is raised.
+		"""
+
+		relative_offset = dirty_page.primary_file_offset - BASE_BLOCK_LENGTH_PRIMARY
+
+		if relative_offset % 512 != 0: # Dirty pages are aligned to the sector size (512 bytes).
+			raise DirtyPageException('Unaligned offset of a dirty page: {}'.format(dirty_page.primary_file_offset))
+
+		if dirty_page.page_size == 0 or dirty_page.page_size % 512 != 0:
+			raise DirtyPageException('Invalid size of a dirty page: {}'.format(dirty_page.page_size))
+
+		if relative_offset + dirty_page.page_size > hbins_data_size:
+			raise DirtyPageException('Dirty page is out of the hive bins data: {} + {} > {}'.format(relative_offset, dirty_page.page_size, hbins_data_size))
+
 	def apply_old_log_file(self, log_file_object):
 		"""Apply a transaction log file (old format) to a primary file."""
 
@@ -1287,12 +1303,25 @@ class PrimaryFile(object):
 		if not self.baseblock.is_file_dirty:
 			raise RecoveryException('There is no need to apply the log file')
 
-		self.old_log_file = OldLogFile(log_file_object)
-		log_timestamp = self.old_log_file.baseblock.effective_last_written_timestamp
+		old_log_file = OldLogFile(log_file_object)
+
+		if self.baseblock.is_baseblock_valid:
+			# Bind the sequence numbers: a log file from an older generation of this primary file is not eligible.
+			log_sequence_number = old_log_file.baseblock.get_primary_sequence_number()
+			secondary_sequence_number = self.baseblock.get_secondary_sequence_number()
+
+			if c_uint32(log_sequence_number - secondary_sequence_number).value > 0x7FFFFFFF:
+				raise NotEligibleException('This log file cannot be applied')
+
+		log_timestamp = old_log_file.baseblock.effective_last_written_timestamp
 		primary_timestamp = self.baseblock.effective_last_written_timestamp
 
 		if log_timestamp < primary_timestamp:
 			raise NotEligibleException('This log file cannot be applied')
+
+		# The log file has been accepted, record its source.
+		# (The same source record is kept for read and rejected outcomes: a rejected log file does not clobber it.)
+		self.old_log_file = old_log_file
 
 		self.baseblock.effective_hbins_data_size = self.old_log_file.baseblock.effective_hbins_data_size
 		self.baseblock.effective_root_cell_offset = self.old_log_file.baseblock.effective_root_cell_offset
@@ -1305,6 +1334,7 @@ class PrimaryFile(object):
 		self.create_writable_file_object()
 
 		for dirty_page in self.old_log_file.dirty_pages(): # Apply dirty pages.
+			self.validate_dirty_page(dirty_page, self.old_log_file.baseblock.effective_hbins_data_size)
 			self.file.write_binary(dirty_page.primary_file_offset, dirty_page.get_bytes())
 
 		self.log_apply_count += 1
@@ -1321,13 +1351,29 @@ class PrimaryFile(object):
 		if not self.baseblock.is_file_dirty:
 			raise RecoveryException('There is no need to apply the log file')
 
-		self.new_log_file = NewLogFile(log_file_object)
+		new_log_file = NewLogFile(log_file_object)
 
-		if self.last_sequence_number is not None and self.last_sequence_number >= self.new_log_file.baseblock.get_primary_sequence_number():
-			raise RecoveryException('This log file cannot be applied')
+		log_sequence_number = new_log_file.baseblock.get_primary_sequence_number()
 
-		if self.baseblock.is_baseblock_valid and self.new_log_file.baseblock.get_primary_sequence_number() < self.baseblock.get_secondary_sequence_number():
-			raise NotEligibleException('This log file cannot be applied')
+		if self.last_sequence_number is not None:
+			# Bind the sequence numbers: this log file must continue the chain of applied log entries exactly (no gaps, no overlaps, no reordering).
+			if log_sequence_number != c_uint32(self.last_sequence_number + 1).value:
+				raise RecoveryException('This log file cannot be applied')
+		elif self.baseblock.is_baseblock_valid:
+			# Bind the sequence numbers: the first log file applied must belong to the sequence window of this (dirty) primary file.
+			# A log file from another generation of this primary file (either too old or too new) is not eligible.
+			primary_sequence_number = self.baseblock.get_primary_sequence_number()
+			secondary_sequence_number = self.baseblock.get_secondary_sequence_number()
+
+			delta = c_uint32(log_sequence_number - secondary_sequence_number).value
+			window = c_uint32(primary_sequence_number - secondary_sequence_number).value
+
+			if delta > window:
+				raise NotEligibleException('This log file cannot be applied')
+
+		# The log file has been accepted, record its source.
+		# (The same source record is kept for read and rejected outcomes: a rejected log file does not clobber it.)
+		self.new_log_file = new_log_file
 
 		self.baseblock.effective_root_cell_offset = self.new_log_file.baseblock.effective_root_cell_offset
 		self.baseblock.effective_version = self.new_log_file.baseblock.effective_version
@@ -1344,6 +1390,7 @@ class PrimaryFile(object):
 			self.baseblock.effective_hbins_data_size = log_entry.get_hbins_data_size()
 
 			for dirty_page in log_entry.dirty_pages(): # Apply dirty pages.
+				self.validate_dirty_page(dirty_page, log_entry.get_hbins_data_size())
 				self.file.write_binary(dirty_page.primary_file_offset, dirty_page.get_bytes())
 
 			if callback is not None:
