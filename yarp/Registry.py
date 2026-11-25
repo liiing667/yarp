@@ -8,6 +8,7 @@ from __future__ import unicode_literals, division
 
 from .RegistryFile import RegistryException, BASE_BLOCK_LENGTH_PRIMARY
 from . import RegistryFile, RegistryRecords, RegistryUnicode
+from .SourceEvidence import make_source_record, publish_source_record, get_source_records
 from struct import unpack
 from datetime import datetime, timedelta
 from collections import namedtuple
@@ -52,6 +53,8 @@ RegistryRecords.KEY_IS_SUPERSEDE_TREE: 'IsSupersedeTree',
 
 KEY_FLAG_INHERIT_CLASS = 'InheritClass'
 VALUE_FLAG_TOMBSTONE = 'IsTombstone'
+
+BIG_DATA_SEGMENT_SIZE = 16344
 
 AutoRecoveryResult = namedtuple('AutoRecoveryResult', [ 'recovered', 'is_new_log', 'file_objects' ])
 
@@ -203,15 +206,51 @@ class RegistryHive(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
+	source_record = None
+	"""A stable source identity shared by accepted reads and rejections."""
+
 	def __init__(self, file_object, tolerate_minor_errors = True):
-		self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+		self.source_record = make_source_record(file_object, task = 'value-length-overflow')
+		self.security_record = self.source_record
+
+		try:
+			self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+			self.registry_file.source_record = self.source_record
+		except Exception as exc:
+			publish_source_record(self.source_record, 'rejected', 'RegistryHive.__init__', exc)
+			raise
+
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		publish_source_record(self.source_record, 'accepted', 'RegistryHive.__init__')
 
 	def root_key(self):
 		"""Get and return a root key node (a RegistryKey object)."""
 
-		return RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+		try:
+			root_key = RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+			root_key.source_record = self.source_record
+			self.source_record.record_event('root_key_published')
+			self.source_record.publish()
+			return root_key
+		except Exception as exc:
+			publish_source_record(self.source_record, 'rejected', 'RegistryHive.root_key', exc)
+			raise
+
+	def RootKey(self):
+		"""Compatibility alias for callers using the structure name."""
+
+		return self.root_key()
+
+	def get_source_record(self):
+		"""Return the source record shared by reads and rejections."""
+
+		return self.source_record
+
+	def get_security_record(self):
+		"""Compatibility alias for get_source_record()."""
+
+		return self.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
@@ -440,6 +479,8 @@ class RegistryKey(object):
 		self.layer = layer
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		self.source_record = getattr(primary_file, 'source_record', None)
+		self.security_record = self.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
@@ -865,6 +906,32 @@ class RegistrySecurity(object):
 
 		return self.key_security.get_security_descriptor()
 
+class BigDataCommit(object):
+	"""A verified big data layout that can be safely committed to a byte string."""
+
+	def __init__(self, data_size, segments_count, segments_list_offset, segment_offsets, segment_lengths, segment_parts, segment_slack, big_data_slack, segments_list_slack):
+		self.data_size = data_size
+		self.segments_count = segments_count
+		self.segments_list_offset = segments_list_offset
+		self.segment_offsets = segment_offsets
+		self.segment_lengths = segment_lengths
+		self.segment_parts = segment_parts
+		self.segment_slack = segment_slack
+		self.big_data_slack = big_data_slack
+		self.segments_list_slack = segments_list_slack
+
+	def read(self):
+		"""Concatenate verified segments and return exactly the declared data size."""
+
+		if self.segment_parts is None:
+			raise WalkException('Big data was validated without a data payload')
+
+		data = b''.join(self.segment_parts)
+		if len(data) != self.data_size:
+			raise WalkException('Invalid big data size: {} != {}'.format(len(data), self.data_size))
+
+		return data
+
 class RegistryValue(object):
 	"""This is a high-level class for a registry value."""
 
@@ -885,6 +952,18 @@ class RegistryValue(object):
 
 		self.key_value = RegistryRecords.KeyValue(buf)
 		self.cell_relative_offset = None # This is set externally.
+		self.source_record = getattr(primary_file, 'source_record', None)
+		self.security_record = self.source_record
+
+	def get_source_record(self):
+		"""Return the source record shared by accepted reads and rejections."""
+
+		return self.source_record
+
+	def get_security_record(self):
+		"""Compatibility alias for get_source_record()."""
+
+		return self.source_record
 
 	def name(self):
 		"""Get, decode and return a value name string."""
@@ -915,85 +994,143 @@ class RegistryValue(object):
 
 		return self.key_value.get_data_size_real()
 
+	def _is_big_data(self):
+		return self.registry_file.baseblock.effective_version > 3 and self.key_value.get_data_size_real() > BIG_DATA_SEGMENT_SIZE
+
+	def _bind_read_exception(self, exc, stage, reason_code = None):
+		if self.source_record is not None:
+			if reason_code is None:
+				try:
+					is_big_data = self._is_big_data()
+				except Exception:
+					is_big_data = False
+				reason_code = 'big_data_segment_boundary_invalid' if is_big_data else 'source_read_rejected'
+			self.source_record.bind_exception(exc, stage, reason_code)
+			self.source_record.publish()
+		return exc
+
+	def _record_read(self, stage, **details):
+		if self.source_record is not None:
+			self.source_record.record_read(stage, 'accepted', **details)
+			self.source_record.publish()
+
+	def _big_data_commit(self, collect_data = True):
+		"""Validate the complete external segment layout before any concatenation."""
+
+		data_size = self.key_value.get_data_size_real()
+		segments_count_expected = (data_size + BIG_DATA_SEGMENT_SIZE - 1) // BIG_DATA_SEGMENT_SIZE
+		if segments_count_expected > 0xFFFF:
+			raise WalkException('Big data size cannot be represented by external segments: {}'.format(data_size))
+
+		big_data_offset = self.key_value.get_data_offset()
+		if big_data_offset == RegistryFile.CELL_OFFSET_NIL:
+			raise WalkException('Invalid big data offset')
+
+		big_data = RegistryRecords.BigData(self.get_cell(big_data_offset))
+		segments_count = big_data.get_segments_count()
+		if segments_count != segments_count_expected:
+			raise WalkException('Invalid number of segments: {} != {}'.format(segments_count, segments_count_expected))
+
+		segments_list_offset = big_data.get_segments_list_offset()
+		if segments_list_offset == RegistryFile.CELL_OFFSET_NIL:
+			raise WalkException('Invalid segments list offset')
+
+		segments_list_buf = self.get_cell(segments_list_offset)
+		if len(segments_list_buf) < segments_count * 4:
+			raise WalkException('Invalid segments list size: {} < {}'.format(len(segments_list_buf), segments_count * 4))
+
+		segments_list = RegistryRecords.SegmentsList(segments_list_buf, segments_count)
+		segment_offsets = list(segments_list.elements())
+		if len(set(segment_offsets)) != len(segment_offsets):
+			raise WalkException('External segment offsets are reused')
+
+		segment_lengths = []
+		segment_parts = []
+		segment_slack = []
+
+		data_length = data_size
+		for segment_offset in segment_offsets:
+			if segment_offset == RegistryFile.CELL_OFFSET_NIL:
+				raise WalkException('Invalid segment offset')
+
+			if data_length > BIG_DATA_SEGMENT_SIZE:
+				segment_length = BIG_DATA_SEGMENT_SIZE
+			else:
+				segment_length = data_length
+
+			segment_buf = self.get_cell(segment_offset)
+			if len(segment_buf) < segment_length:
+				raise WalkException('Invalid segment size: {} < {}'.format(len(segment_buf), segment_length))
+
+			segment_lengths.append(segment_length)
+			if collect_data:
+				segment_parts.append(segment_buf[ : segment_length])
+			segment_slack.append(segment_buf[segment_length : ])
+			data_length -= segment_length
+
+		if data_length != 0:
+			raise WalkException('External segments do not cover the declared data size: {} bytes missing'.format(data_length))
+
+		if sum(segment_lengths) != data_size:
+			raise WalkException('External segment total length does not match the declared data size')
+
+		return BigDataCommit(
+			data_size,
+			segments_count,
+			segments_list_offset,
+			segment_offsets,
+			segment_lengths,
+			segment_parts if collect_data else None,
+			segment_slack,
+			big_data.get_slack(),
+			segments_list.get_slack(),
+		)
+
 	def data_raw(self):
 		"""Get and return data (as raw bytes)."""
 
-		if self.key_value.get_data_size_real() == 0:
-			return b''
+		try:
+			if self.key_value.get_data_size_real() == 0:
+				return b''
 
-		if self.key_value.is_data_inline():
-			return self.key_value.get_inline_data()[ : self.key_value.get_data_size_real()]
+			if self.key_value.is_data_inline():
+				return self.key_value.get_inline_data()[ : self.key_value.get_data_size_real()]
 
-		is_big_data = self.registry_file.baseblock.effective_version > 3 and self.key_value.get_data_size_real() > 16344
-		if not is_big_data:
-			return self.get_cell(self.key_value.get_data_offset())[ : self.key_value.get_data_size_real()]
+			if not self._is_big_data():
+				return self.get_cell(self.key_value.get_data_offset())[ : self.key_value.get_data_size_real()]
 
-		big_data_buf = self.get_cell(self.key_value.get_data_offset())
-		big_data = RegistryRecords.BigData(big_data_buf)
-
-		segments_list_offset = big_data.get_segments_list_offset()
-		segments_count = big_data.get_segments_count()
-
-		segments_list = RegistryRecords.SegmentsList(self.get_cell(segments_list_offset), segments_count)
-
-		data = b''
-		data_length = self.key_value.get_data_size_real()
-		for segment_offset in segments_list.elements():
-			buf = self.get_cell(segment_offset)
-
-			if data_length > 16344:
-				data_part = buf[ : 16344]
-				if len(data_part) != 16344:
-					raise WalkException('Invalid segment size: {} != 16344'.format(len(data_part)))
-
-				data += data_part
-				data_length -= 16344
-			else:
-				data += buf[ : data_length]
-				break
-
-		return data
+			commit = self._big_data_commit()
+			data = commit.read()
+			self._record_read(
+				'RegistryValue.data_raw',
+				data_size = commit.data_size,
+				segments_count = commit.segments_count,
+			)
+			return data
+		except Exception as exc:
+			self._bind_read_exception(exc, 'RegistryValue.data_raw')
+			raise
 
 	def data_slack(self):
 		"""Get and return the data slack (as a list of raw bytes)."""
 
-		if self.key_value.get_data_size_real() == 0 or self.key_value.is_data_inline():
-			# No data slack in these cases.
-			return []
+		try:
+			if self.key_value.get_data_size_real() == 0 or self.key_value.is_data_inline():
+				# No data slack in these cases.
+				return []
 
-		is_big_data = self.registry_file.baseblock.effective_version > 3 and self.key_value.get_data_size_real() > 16344
-		if not is_big_data:
-			slack = self.get_cell(self.key_value.get_data_offset())[self.key_value.get_data_size_real() : ]
-			return [slack]
+			if not self._is_big_data():
+				slack = self.get_cell(self.key_value.get_data_offset())[self.key_value.get_data_size_real() : ]
+				return [slack]
 
-		slack_list = []
+			commit = self._big_data_commit(collect_data = False)
+			slack_list = [commit.big_data_slack, commit.segments_list_slack]
+			slack_list.extend(commit.segment_slack)
 
-		big_data_buf = self.get_cell(self.key_value.get_data_offset())
-		big_data = RegistryRecords.BigData(big_data_buf)
-
-		slack_list.append(big_data.get_slack())
-
-		segments_list_offset = big_data.get_segments_list_offset()
-		segments_count = big_data.get_segments_count()
-
-		segments_list = RegistryRecords.SegmentsList(self.get_cell(segments_list_offset), segments_count)
-
-		slack_list.append(segments_list.get_slack())
-
-		data_length = self.key_value.get_data_size_real()
-		for segment_offset in segments_list.elements():
-			buf = self.get_cell(segment_offset)
-
-			if data_length > 16344:
-				slack = buf[16344 : ]
-				slack_list.append(slack)
-				data_length -= 16344
-			else:
-				slack = buf[data_length : ]
-				slack_list.append(slack)
-				break
-
-		return slack_list
+			return slack_list
+		except Exception as exc:
+			self._bind_read_exception(exc, 'RegistryValue.data_slack')
+			raise
 
 	def data(self):
 		"""Get, decode and return data (as an integer, a string, a list of strings, or raw bytes).
@@ -1067,8 +1204,27 @@ class RegistryHiveTruncated(object):
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
 	def __init__(self, file_object):
-		self.registry_file = RegistryFile.PrimaryFileTruncated(file_object)
+		self.source_record = make_source_record(file_object, task = 'value-length-overflow')
+		self.security_record = self.source_record
+		try:
+			self.registry_file = RegistryFile.PrimaryFileTruncated(file_object)
+			self.registry_file.source_record = self.source_record
+		except Exception as exc:
+			publish_source_record(self.source_record, 'rejected', 'RegistryHiveTruncated.__init__', exc)
+			raise
+
 		self.effective_slack = set()
+		publish_source_record(self.source_record, 'accepted', 'RegistryHiveTruncated.__init__')
+
+	def get_source_record(self):
+		"""Return the source record shared by reads and rejections."""
+
+		return self.source_record
+
+	def get_security_record(self):
+		"""Compatibility alias for get_source_record()."""
+
+		return self.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
