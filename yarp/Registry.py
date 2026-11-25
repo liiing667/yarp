@@ -146,7 +146,8 @@ def GuessHiveRole(file_object):
 	def collect_keys_truncated(file_object):
 		keys = []
 
-		hive = RegistryHiveTruncated(file_object)
+		# This is an explicit fallback for a hive that could not be parsed normally: accept a marked partial result.
+		hive = RegistryHiveTruncated(file_object, allow_partial_results = True)
 		for item in hive.scan():
 			if type(item) is not RegistryKey:
 				continue
@@ -1066,9 +1067,38 @@ class RegistryHiveTruncated(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object):
-		self.registry_file = RegistryFile.PrimaryFileTruncated(file_object)
+	is_fragment = None
+	"""True when this object represents a primary file synthesized from a hive bins fragment."""
+
+	def __init__(self, file_object, allow_partial_results = False, is_fragment = False):
+		"""Open a truncated registry hive.
+
+		By default, this constructor fails closed: if the primary file is truncated, a RegistryFile.TruncationException
+		is raised and no traversable prefix is silently returned. Set 'allow_partial_results' to True to explicitly
+		accept a partial result; in that case the 'is_partial_result()' method returns True and the 'source_record' attribute
+		returns a record describing the readable prefix and the truncation point. When 'file_object' was synthesized
+		from a hive bins fragment (see RegistryFile.FragmentTranslator), set 'is_fragment' to True.
+		"""
+
+		self.is_fragment = is_fragment
+		self.registry_file = RegistryFile.PrimaryFileTruncated(file_object, allow_partial_results, is_fragment)
 		self.effective_slack = set()
+
+	def is_partial_result(self):
+		"""Return True if only a prefix of the declared hive bins data is available."""
+
+		return self.registry_file.is_partial_result
+
+	def is_truncated(self):
+		"""Return True if the primary file does not contain the hive bins data declared in its base block."""
+
+		return self.registry_file.is_truncated()
+
+	@property
+	def source_record(self):
+		"""The RegistryFile.TruncationSourceRecord for this hive (shared by reads and by rejections)."""
+
+		return self.registry_file.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""

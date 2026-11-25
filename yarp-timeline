@@ -111,7 +111,8 @@ def process_remnant_data(log_files, recovery_result):
 			primary_file_rebuilt = log.rebuild_primary_file_using_remnant_log_entries(is_unused, sequence_number)
 			counter += 1
 
-			hive = Registry.RegistryHiveTruncated(primary_file_rebuilt)
+			# A primary file rebuilt from remnant log entries is partial by construction: mark it explicitly.
+			hive = Registry.RegistryHiveTruncated(primary_file_rebuilt, allow_partial_results = True, is_fragment = True)
 			for item in hive.scan():
 				if type(item) is Registry.RegistryKey:
 					key_parsed = parse_key(item, False) # Treat this key as is (not as a deleted one).
@@ -229,17 +230,21 @@ except RegistryFile.BaseBlockException:
 	temp_obj.close()
 
 	is_truncated = True
+	is_fragment = True
 except Registry.RegistryException:
 	is_truncated = True
+	is_fragment = False
 else:
 	is_truncated = is_hive_obviously_truncated()
+	is_fragment = False
 
 if is_truncated and not args.truncated:
 	print('Primary file is truncated, use the "--truncated" switch', file = sys.stderr)
 	sys.exit(1)
 
 if args.truncated:
-	hive = Registry.RegistryHiveTruncated(primary)
+	# The '--truncated' switch is the explicit, fail-open marker requested by the caller.
+	hive = Registry.RegistryHiveTruncated(primary, allow_partial_results = True, is_fragment = is_fragment)
 	extend_keys_list_truncated()
 
 	keys_list = list(set(keys_list))

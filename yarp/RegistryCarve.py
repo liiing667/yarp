@@ -806,7 +806,7 @@ class HiveReconstructor(object):
 
 			primary_obj = BytesIO(primary_buf)
 
-			primary_file = RegistryFile.PrimaryFileTruncated(primary_obj)
+			primary_file = RegistryFile.PrimaryFileTruncated(primary_obj, allow_partial_results = True)
 			for hive_bin in primary_file.hive_bins(): # Get the last hive bin in the first fragment.
 				pass
 
@@ -865,7 +865,7 @@ class HiveReconstructor(object):
 
 			primary_obj = BytesIO(primary_buf)
 
-			primary_file = RegistryFile.PrimaryFileTruncated(primary_obj)
+			primary_file = RegistryFile.PrimaryFileTruncated(primary_obj, allow_partial_results = True)
 			for hive_bin in primary_file.hive_bins(): # Get the last hive bin in the first fragment.
 				pass
 
@@ -888,7 +888,7 @@ class HiveReconstructor(object):
 
 					hbins_data_size_remaining_2 = hbins_data_size_remaining - len(fragment_buf_2)
 
-					primary_file = RegistryFile.PrimaryFileTruncated(primary_obj)
+					primary_file = RegistryFile.PrimaryFileTruncated(primary_obj, allow_partial_results = True)
 					for hive_bin in primary_file.hive_bins(): # Get the last hive bin in the first two fragments.
 						pass
 
@@ -954,7 +954,7 @@ class HiveReconstructor(object):
 
 			primary_obj = BytesIO(primary_buf)
 
-			primary_file = RegistryFile.PrimaryFileTruncated(primary_obj)
+			primary_file = RegistryFile.PrimaryFileTruncated(primary_obj, allow_partial_results = True)
 			for hive_bin in primary_file.hive_bins(): # Get the last hive bin in the first fragment.
 				pass
 
@@ -977,7 +977,7 @@ class HiveReconstructor(object):
 
 					hbins_data_size_remaining_2 = hbins_data_size_remaining - len(fragment_buf_2)
 
-					primary_file = RegistryFile.PrimaryFileTruncated(primary_obj)
+					primary_file = RegistryFile.PrimaryFileTruncated(primary_obj, allow_partial_results = True)
 					for hive_bin in primary_file.hive_bins(): # Get the last hive bin in the first two fragments.
 						pass
 
@@ -1000,7 +1000,7 @@ class HiveReconstructor(object):
 
 							hbins_data_size_remaining_3 = hbins_data_size_remaining_2 - len(fragment_buf_3)
 
-							primary_file = RegistryFile.PrimaryFileTruncated(primary_obj)
+							primary_file = RegistryFile.PrimaryFileTruncated(primary_obj, allow_partial_results = True)
 							for hive_bin in primary_file.hive_bins(): # Get the last hive bin in the first three fragments.
 								pass
 
@@ -1118,7 +1118,7 @@ class HiveReconstructor(object):
 			next_fragments_used = []
 
 			for step in range(0, hbin_fragments_count_max):
-				primary_file = RegistryFile.PrimaryFileTruncated(primary_obj)
+				primary_file = RegistryFile.PrimaryFileTruncated(primary_obj, allow_partial_results = True)
 				for hive_bin in primary_file.hive_bins(): # Get the last hive bin in the first fragment.
 					pass
 

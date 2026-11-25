@@ -962,7 +962,7 @@ def test_carving(recover_fragments):
 
 				assert src_buf == dst_buf
 
-				tmp_hive = Registry.RegistryHiveTruncated(dst_obj)
+				tmp_hive = Registry.RegistryHiveTruncated(dst_obj, allow_partial_results = True, is_fragment = True)
 			elif c == 1:
 				assert type(i) is RegistryCarve.CarveResult
 				assert i.offset == 512
@@ -984,7 +984,7 @@ def test_carving(recover_fragments):
 
 				assert src_buf == dst_buf
 
-				tmp_hive = Registry.RegistryHiveTruncated(dst_obj)
+				tmp_hive = Registry.RegistryHiveTruncated(dst_obj, allow_partial_results = True, is_fragment = True)
 			elif c == 3:
 				assert type(i) is RegistryCarve.CarveResultFragment
 				assert i.offset == 262144
@@ -999,7 +999,7 @@ def test_carving(recover_fragments):
 
 				assert src_buf == dst_buf
 
-				tmp_hive = Registry.RegistryHiveTruncated(dst_obj)
+				tmp_hive = Registry.RegistryHiveTruncated(dst_obj, allow_partial_results = True, is_fragment = True)
 			else:
 				assert False
 
@@ -1247,11 +1247,106 @@ def test_remnants():
 
 def test_truncated():
 	with open(hive_truncated, 'rb') as f:
-		hive = Registry.RegistryHiveTruncated(f)
+		hive = Registry.RegistryHiveTruncated(f, allow_partial_results = True)
 
 		for i in hive.scan():
 			assert type(i) is Registry.RegistryKey
 			assert i.name() in [ '{6214ff27-7b1b-41a3-9ae4-5fb851ffed63}', 'key_with_many_subkeys' ] or int(i.name()) > 0
+
+def test_truncated_fail_closed():
+	# A truncated primary file must fail closed: no traversable prefix is returned silently.
+	with open(hive_truncated, 'rb') as f:
+		with pytest.raises(RegistryFile.TruncationException) as exc_info:
+			Registry.RegistryHiveTruncated(f)
+
+	source_record = exc_info.value.source_record
+
+	assert isinstance(exc_info.value, RegistryFile.ReadException)
+	assert source_record.is_truncated
+	assert not source_record.is_fragment
+	assert source_record.file_size < source_record.declared_file_size
+	assert source_record.truncation_point == source_record.file_size
+	assert source_record.missing_size > 0
+	assert source_record.truncation_scenario in [
+		RegistryFile.TRUNCATION_SCENARIO_HBIN_BOUNDARY,
+		RegistryFile.TRUNCATION_SCENARIO_WITHIN_LAST_HBIN,
+		RegistryFile.TRUNCATION_SCENARIO_OBVIOUS
+	]
+
+def test_truncated_partial_is_marked():
+	# An explicit consumer may opt in to a partial result, which has to be marked and carry a source record.
+	with open(hive_truncated, 'rb') as f:
+		hive = Registry.RegistryHiveTruncated(f, allow_partial_results = True)
+
+		assert hive.is_partial_result()
+		assert hive.is_truncated()
+
+		source_record = hive.source_record
+		assert source_record.is_truncated
+
+		# Reads stay within the readable prefix.
+		keys = [ i for i in hive.scan() if type(i) is Registry.RegistryKey ]
+		assert len(keys) > 0
+
+		# A rejection past the truncation point keeps the same source record.
+		with pytest.raises(RegistryFile.TruncationException) as exc_info:
+			hive.registry_file.get_cell_naive(source_record.hbins_data_size + 1)
+
+		assert exc_info.value.source_record is source_record
+
+def test_truncated_full_hive_kept():
+	# A complete (read-only) primary file must not be treated as truncated and must remain fully traversable.
+	with open(hive_empty, 'rb') as f:
+		hive = Registry.RegistryHiveTruncated(f)
+
+	assert not hive.is_truncated()
+	assert not hive.is_partial_result()
+
+	source_record = hive.source_record
+	assert not source_record.is_truncated
+	assert source_record.truncation_point is None
+	assert source_record.missing_size == 0
+
+	# The same complete hive is still served by the ordinary RegistryHive class.
+	with open(hive_empty, 'rb') as f:
+		normal_hive = Registry.RegistryHive(f)
+		assert normal_hive.root_key() is not None
+
+def test_truncated_scenarios():
+	with open(hive_bigdata, 'rb') as f:
+		buf = f.read()
+
+	# Truncation within the last hive bin.
+	cut_within = RegistryFile.BASE_BLOCK_LENGTH_PRIMARY + RegistryFile.HIVE_BIN_SIZE_ALIGNMENT + 1000
+	with pytest.raises(RegistryFile.TruncationException) as exc_info:
+		RegistryFile.PrimaryFileTruncated(BytesIO(buf[ : cut_within]))
+
+	rejected_record = exc_info.value.source_record
+	assert rejected_record.truncation_scenario == RegistryFile.TRUNCATION_SCENARIO_WITHIN_LAST_HBIN
+
+	# Truncation at a boundary of a hive bin.
+	cut_boundary = RegistryFile.BASE_BLOCK_LENGTH_PRIMARY + 3 * RegistryFile.HIVE_BIN_SIZE_ALIGNMENT
+	with pytest.raises(RegistryFile.TruncationException) as exc_info:
+		RegistryFile.PrimaryFileTruncated(BytesIO(buf[ : cut_boundary]))
+
+	assert exc_info.value.source_record.truncation_scenario == RegistryFile.TRUNCATION_SCENARIO_HBIN_BOUNDARY
+
+	# A partial result exposes the same truncation metadata as the fail-closed rejection.
+	partial = RegistryFile.PrimaryFileTruncated(BytesIO(buf[ : cut_within]), allow_partial_results = True)
+	assert partial.is_partial_result
+	assert partial.source_record == rejected_record
+
+def test_truncated_fragment_marked():
+	# A primary file synthesized from a fragment is partial by construction and never fails closed.
+	with open(truncated_hbin, 'rb') as f:
+		hive_obj = RegistryFile.FragmentTranslator(f)
+
+	hive = Registry.RegistryHiveTruncated(hive_obj, is_fragment = True)
+	assert hive.is_partial_result()
+	assert hive.source_record.is_fragment
+
+	keys = [ i for i in hive.scan() if type(i) is Registry.RegistryKey ]
+	assert len(keys) == 2
 
 def test_effective_hbins_data_size():
 	with open(hive_effective_size, 'rb') as f:
@@ -1449,7 +1544,7 @@ def test_hive_slack():
 		assert len(hive.effective_slack) > 0
 		assert b'SLCK' in hive.effective_slack
 
-		hive = Registry.RegistryHiveTruncated(f)
+		hive = Registry.RegistryHiveTruncated(f, allow_partial_results = True)
 		assert len(hive.effective_slack) == 0
 
 		for i in hive.scan():
@@ -2298,7 +2393,7 @@ def test_translator():
 	with open(truncated_hbin, 'rb') as src_obj:
 		hive_obj = RegistryFile.FragmentTranslator(src_obj)
 
-		hive = Registry.RegistryHiveTruncated(hive_obj)
+		hive = Registry.RegistryHiveTruncated(hive_obj, allow_partial_results = True, is_fragment = True)
 
 		c = 0
 		for key in hive.scan():
@@ -2323,7 +2418,7 @@ def test_translator_with_margin():
 			src_obj = BytesIO(src_buf)
 
 			hive_obj = RegistryFile.FragmentTranslator(RegistryFile.FragmentWithMarginTranslator(src_obj, i.suggested_margin))
-			hive = Registry.RegistryHiveTruncated(hive_obj)
+			hive = Registry.RegistryHiveTruncated(hive_obj, allow_partial_results = True, is_fragment = True)
 			for item in hive.scan():
 				pass
 
@@ -2344,7 +2439,7 @@ def test_translator_with_margin():
 			src_obj = BytesIO(src_buf)
 
 			hive_obj = RegistryFile.FragmentTranslator(RegistryFile.FragmentWithMarginTranslator(src_obj, i.suggested_margin))
-			hive = Registry.RegistryHiveTruncated(hive_obj)
+			hive = Registry.RegistryHiveTruncated(hive_obj, allow_partial_results = True, is_fragment = True)
 			for item in hive.scan():
 				pass
 
@@ -2365,7 +2460,7 @@ def test_translator_with_margin():
 			src_obj = BytesIO(src_buf)
 
 			hive_obj = RegistryFile.FragmentTranslator(RegistryFile.FragmentWithMarginTranslator(src_obj, i.suggested_margin))
-			hive = Registry.RegistryHiveTruncated(hive_obj)
+			hive = Registry.RegistryHiveTruncated(hive_obj, allow_partial_results = True, is_fragment = True)
 			for item in hive.scan():
 				pass
 
@@ -2377,7 +2472,7 @@ def test_invalid_parent_fragment():
 	with open(fragment_invalid_parent, 'rb') as f:
 		hive_obj = RegistryFile.FragmentTranslator(f)
 
-		hive = Registry.RegistryHiveTruncated(hive_obj)
+		hive = Registry.RegistryHiveTruncated(hive_obj, allow_partial_results = True, is_fragment = True)
 
 		c = 0
 		for key in hive.scan():
@@ -2950,7 +3045,7 @@ def test_log_carving_1():
 			assert type(l) is RegistryFile.LogEntry
 
 		hive_obj = log.rebuild_primary_file_using_remnant_log_entries(True)
-		hive = Registry.RegistryHiveTruncated(hive_obj)
+		hive = Registry.RegistryHiveTruncated(hive_obj, allow_partial_results = True, is_fragment = True)
 
 		cc = 0
 
@@ -3017,7 +3112,7 @@ def test_log_carving_2():
 			assert type(l) is RegistryFile.LogEntry
 
 		hive_obj = log.rebuild_primary_file_using_remnant_log_entries(True)
-		hive = Registry.RegistryHiveTruncated(hive_obj)
+		hive = Registry.RegistryHiveTruncated(hive_obj, allow_partial_results = True, is_fragment = True)
 
 		cc = 0
 		for l in hive.scan():

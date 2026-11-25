@@ -1,3 +1,11 @@
+Version: 1.0.34
+
+RegistryFile, Registry: truncated primary files now fail closed by default (the TruncationException is raised instead of returning a traversable prefix that could be mistaken for a complete forensic result); partial results are available only when explicitly requested (the 'allow_partial_results' argument) and are marked via the 'is_partial_result' method and the TruncationSourceRecord object (truncation point, missing size, scenario and source file size). Rejections and accepted prefixes share the same source record. Complete (including read-only) primary files and small valid hives are unaffected.
+RegistrySqlite, yarp-print, yarp-timeline: request and surface the marked partial results explicitly (the existing 'truncated' markers are retained).
+RegistryCarve: mark reconstructed partial primary files explicitly.
+
+---
+
 Version: 1.0.33
 
 yarp-print: print deleted values correctly when dealing with truncated hives, print remnant value data (having no corresponding deleted key value).

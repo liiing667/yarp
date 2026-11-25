@@ -43,6 +43,26 @@ CELL_SIZE_MAX_NAIVE = 10 * 1024 * 1024
 DirtyPageMeta = namedtuple('DirtyPageMeta', [ 'relative_offset_primary', 'relative_offset_log' ])
 DirtyPageReference = namedtuple('DirtyPageReference', [ 'relative_offset_primary', 'size' ])
 
+# Truncation scenarios (aligned with the scenarios reported by the RegistryCarve module).
+TRUNCATION_SCENARIO_HBIN_BOUNDARY     = 1 # The file ends at a boundary of a hive bin (at least one hive bin is missing).
+TRUNCATION_SCENARIO_WITHIN_LAST_HBIN  = 2 # The file ends within the last hive bin (the previous hive bins are complete).
+TRUNCATION_SCENARIO_OBVIOUS           = 3 # The file ends before the hive bins data size declared in the base block.
+
+# This record describes the source of data returned (or refused) to a caller when dealing with a truncated primary file.
+# Every field is filled from the very same source object (the primary file being parsed), so a caller can audit both
+# the accepted prefix and the rejection point without opening another file.
+TruncationSourceRecord = namedtuple('TruncationSourceRecord', [
+	'is_truncated',            # True if the primary file is truncated (the declared data does not fit into the file).
+	'is_fragment',             # True if the primary file was synthesized from a hive bins fragment.
+	'file_size',               # The actual size of the primary file (in bytes).
+	'declared_file_size',      # The size expected according to the base block (in bytes).
+	'hbins_data_size',         # The hive bins data size declared in the base block (in bytes).
+	'available_hbins_size',    # The size of the hive bins data actually available in the file (in bytes, aligned).
+	'truncation_point',        # An absolute offset (in bytes) at which the readable prefix ends.
+	'missing_size',            # The number of bytes missing after the truncation point (in bytes).
+	'truncation_scenario'      # A truncation scenario (one of the TRUNCATION_SCENARIO_* constants) or None.
+])
+
 def Marvin32(Buffer, Seed = MARVIN32_SEED):
 	"""Calculate and return the Marvin32 hash (64 bits) of Buffer."""
 
@@ -209,6 +229,20 @@ class CellOffsetException(RegistryException):
 
 	def __init__(self, value):
 		self._value = value
+
+	def __str__(self):
+		return repr(self._value)
+
+class TruncationException(ReadException):
+	"""This exception is raised (fail-closed) when a truncated primary file cannot yield a complete result.
+
+	The 'source_record' field is a TruncationSourceRecord object describing both the readable prefix and the
+	truncation point, it is filled from the same source object as any partial result a caller may request.
+	"""
+
+	def __init__(self, value, source_record = None):
+		self._value = value
+		self.source_record = source_record
 
 	def __str__(self):
 		return repr(self._value)
@@ -1409,6 +1443,13 @@ class PrimaryFile(object):
 class PrimaryFileTruncated(object):
 	"""This is a class for a truncated primary file, it provides methods to read the truncated file, to build the maps of cells, and to yield each cell.
 	This class should be used as a replacement for the PrimaryFile class.
+
+	By default, this class fails closed: when the primary file does not contain the hive bins data declared in its
+	base block, a TruncationException is raised and no traversable prefix is silently returned. A caller may opt in to
+	partial results by setting 'allow_partial_results' to True; in that case the object is marked as partial (see the
+	'is_partial_result' attribute and the 'source_record' attribute) and only the readable prefix is exposed.
+	When the primary file was synthesized from a hive bins fragment, set 'is_fragment' to True: a fragment is always
+	partial by construction, so no fail-closed exception is raised for it.
 	"""
 
 	file = None
@@ -1426,38 +1467,153 @@ class PrimaryFileTruncated(object):
 	cell_map_free = None
 	"""A map of free (unallocated only) cells."""
 
-	def __init__(self, file_object):
+	cell_map_allocated_complete = None
+	"""A map of allocated cells built from the complete hive bins data (or None, if unavailable)."""
+
+	cell_map_unallocated_complete = None
+	"""A map of unallocated cells built from the complete hive bins data (or None, if unavailable)."""
+
+	is_partial_result = None
+	"""True when the maps of cells cover only a readable prefix of the declared hive bins data."""
+
+	is_fragment = None
+	"""True when this object represents a primary file synthesized from a hive bins fragment."""
+
+	source_record = None
+	"""A TruncationSourceRecord describing the source object, the readable prefix and (if any) the truncation point."""
+
+	truncation_exception = None
+	"""A TruncationException raised while parsing (kept for callers working with partial results)."""
+
+	def __init__(self, file_object, allow_partial_results = False, is_fragment = False):
 		self.file_object = file_object
 		self.writable = False
 		self.file = RegistryFile(file_object)
+		self.allow_partial_results = allow_partial_results
+		self.is_fragment = is_fragment
+		self.is_partial_result = False
+		self.truncation_exception = None
 
 		self.baseblock = BaseBlock(self.file_object)
 		if not self.baseblock.is_primary_file:
 			raise NotSupportedException('Invalid file type')
 
+		# Build the source record from this very same source object before any cell map is exposed.
+		self.source_record = self._build_source_record()
+
 		self.build_cell_maps()
 
-	def hive_bins(self):
+	def _build_source_record(self):
+		"""Build and return a TruncationSourceRecord from the current source object."""
+
+		file_size = self.file.get_file_size()
+		hbins_data_size = self.baseblock.effective_hbins_data_size
+		declared_file_size = BASE_BLOCK_LENGTH_PRIMARY + hbins_data_size
+
+		# The readable prefix of the hive bins data, aligned down to a hive bin boundary.
+		if file_size <= BASE_BLOCK_LENGTH_PRIMARY:
+			available_hbins_size = 0
+		else:
+			available_hbins_size = ((file_size - BASE_BLOCK_LENGTH_PRIMARY) // HIVE_BIN_SIZE_ALIGNMENT) * HIVE_BIN_SIZE_ALIGNMENT
+
+		is_truncated = file_size < declared_file_size
+
+		if not is_truncated:
+			truncation_point = None
+			missing_size = 0
+			truncation_scenario = None
+		else:
+			# The truncation point is the end of the last fully available hive bin.
+			truncation_point = BASE_BLOCK_LENGTH_PRIMARY + available_hbins_size
+			missing_size = declared_file_size - truncation_point
+
+			if file_size == truncation_point and file_size % HIVE_BIN_SIZE_ALIGNMENT == 0:
+				# The file ends exactly at a boundary of a hive bin.
+				truncation_scenario = TRUNCATION_SCENARIO_HBIN_BOUNDARY
+			elif available_hbins_size == 0:
+				# The file ends before (or within the header of) the first hive bin.
+				truncation_scenario = TRUNCATION_SCENARIO_OBVIOUS
+			else:
+				# The file ends within the last hive bin.
+				truncation_scenario = TRUNCATION_SCENARIO_WITHIN_LAST_HBIN
+
+		return TruncationSourceRecord(
+			# A primary file synthesized from a fragment is partial (truncated) by construction.
+			is_truncated = is_truncated or self.is_fragment,
+			is_fragment = self.is_fragment,
+			file_size = file_size,
+			declared_file_size = declared_file_size,
+			hbins_data_size = hbins_data_size,
+			available_hbins_size = available_hbins_size,
+			truncation_point = truncation_point,
+			missing_size = missing_size,
+			truncation_scenario = truncation_scenario
+		)
+
+	def _raise_or_record_truncation(self, exception):
+		"""Either fail closed or record the exception and mark the exposed result as partial."""
+
+		self.truncation_exception = exception
+
+		if self.allow_partial_results or self.is_fragment:
+			self.is_partial_result = True
+			return
+
+		raise exception
+
+	def hive_bins(self, tolerate_truncation = None):
 		"""This method yields HiveBin objects."""
+
+		if tolerate_truncation is None:
+			tolerate_truncation = self.allow_partial_results or self.is_fragment
 
 		curr_pos = BASE_BLOCK_LENGTH_PRIMARY
 		while curr_pos - BASE_BLOCK_LENGTH_PRIMARY < self.baseblock.effective_hbins_data_size:
 			try:
 				curr_hivebin = HiveBin(self.file_object, curr_pos, True, self.baseblock.use_old_cell_format)
-			except (HiveBinException, ReadException):
-				break # Since we expect a truncation point, stop here.
+			except (HiveBinException, ReadException) as parse_exception:
+				if isinstance(parse_exception, HiveBinException) and curr_pos < self.file.get_file_size():
+					# A hive bin header inside the file is invalid (garbage at the end of a dirty file, for example):
+					# the file itself is not truncated. Shrink the effective size to the readable prefix.
+					self.baseblock.effective_hbins_data_size = curr_pos - BASE_BLOCK_LENGTH_PRIMARY
+					self.truncation_exception = None
+					self.is_partial_result = False
+					break
+
+				# The next hive bin cannot be read: this is the truncation point. Fail closed or stop at the prefix.
+				source_record = self._build_source_record()
+				self.source_record = source_record
+				exception = TruncationException(
+					'Primary file is truncated at offset: {} ({} bytes missing)'.format(
+						source_record.truncation_point, source_record.missing_size),
+					source_record
+				)
+
+				if tolerate_truncation:
+					self.truncation_exception = exception
+					self.is_partial_result = True
+					break
+
+				raise exception
 
 			yield curr_hivebin
 
 			curr_pos += curr_hivebin.get_size()
 
 	def build_cell_maps(self):
-		"""Build the maps of allocated and unallocated cells."""
+		"""Build the maps of allocated and unallocated cells.
+
+		When the primary file is truncated, the maps are built from the readable prefix only. If partial results are
+		not allowed (and this is not a fragment), a TruncationException carrying the source record is raised.
+		"""
 
 		self.cell_map_allocated = set()
 		self.cell_map_unallocated = set()
+		self.is_partial_result = False
+		self.truncation_exception = None
 
-		for hbin in self.hive_bins():
+		# Always collect the readable prefix first, so the same prefix is available whether we fail or not.
+		for hbin in self.hive_bins(tolerate_truncation = True):
 			for cell in hbin.cells:
 				cell_file_offset = cell.file_offset
 				if cell.is_allocated():
@@ -1468,6 +1624,31 @@ class PrimaryFileTruncated(object):
 		self.cell_map_free = self.cell_map_unallocated
 		self.cell_map_referenced = set()
 
+		# Refresh the source record (the truncation point is now known precisely).
+		self.source_record = self._build_source_record()
+
+		if self.is_fragment:
+			# A primary file synthesized from a fragment is partial by construction (the original primary file is absent).
+			self.is_partial_result = True
+
+		if self.source_record.is_truncated:
+			# The declared hive bins data does not fit into the primary file: the maps cover only a prefix.
+			self.cell_map_allocated_complete = None
+			self.cell_map_unallocated_complete = None
+
+			if self.truncation_exception is None:
+				self.truncation_exception = TruncationException(
+					'Primary file is truncated, declared file size: {}, real file size: {}'.format(
+						self.source_record.declared_file_size, self.source_record.file_size),
+					self.source_record
+				)
+
+			self._raise_or_record_truncation(self.truncation_exception)
+		else:
+			# Everything declared by the base block is present and readable.
+			self.cell_map_allocated_complete = set(self.cell_map_allocated)
+			self.cell_map_unallocated_complete = set(self.cell_map_unallocated)
+
 	def get_cell(self, cell_relative_offset):
 		"""Get and return data from a cell. The cell must be in the map of allocated cells or in the map of unallocated cells."""
 
@@ -1476,6 +1657,13 @@ class PrimaryFileTruncated(object):
 
 		cell_file_offset = BASE_BLOCK_LENGTH_PRIMARY + cell_relative_offset
 		if cell_file_offset not in self.cell_map_allocated and cell_file_offset not in self.cell_map_unallocated:
+			# A requested cell may simply be beyond the truncation point: report this using the same source record.
+			if self.is_partial_result and (self.source_record is None or self.source_record.truncation_point is None or cell_file_offset >= self.source_record.truncation_point):
+				raise TruncationException(
+					'A cell beyond the truncation point was requested (relative offset): {}'.format(cell_relative_offset),
+					self.source_record
+				)
+
 			raise CellOffsetException('There is no valid cell starting at this offset (relative): {}'.format(cell_relative_offset))
 
 		cell = HiveCell(self.file_object, cell_file_offset, self.baseblock.use_old_cell_format)
@@ -1488,6 +1676,13 @@ class PrimaryFileTruncated(object):
 			raise CellOffsetException('Got CELL_OFFSET_NIL')
 
 		cell_file_offset = BASE_BLOCK_LENGTH_PRIMARY + cell_relative_offset
+
+		# Do not follow a naive pointer past the truncation point: the data there was never acquired.
+		if self.is_partial_result and self.source_record is not None and self.source_record.truncation_point is not None and cell_file_offset >= self.source_record.truncation_point:
+			raise TruncationException(
+				'A naive cell beyond the truncation point was requested (relative offset): {}'.format(cell_relative_offset),
+				self.source_record
+			)
 
 		cell = HiveCell(self.file_object, cell_file_offset, self.baseblock.use_old_cell_format)
 
@@ -1508,6 +1703,11 @@ class PrimaryFileTruncated(object):
 			for cell_file_offset in sorted(self.cell_map_unallocated):
 				cell = HiveCell(self.file_object, cell_file_offset, self.baseblock.use_old_cell_format)
 				yield cell
+
+	def is_truncated(self):
+		"""Return True if the primary file does not contain the hive bins data declared in its base block."""
+
+		return self.source_record is not None and self.source_record.is_truncated
 
 def FragmentTranslator(file_object, effective_version = 5):
 	"""This function is used to translate a hive bins fragment (a set of hive bins as a file object) to a truncated primary file (as a BytesIO object).

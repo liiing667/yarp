@@ -151,7 +151,8 @@ class YarpDB(object):
 				# This is an edge case: a truncated dirty hive.
 				self._is_hive_truncated = True
 				self._is_rebuilt = False
-				self._hive = Registry.RegistryHiveTruncated(self._primary)
+				# This interface marks partial results explicitly via the HiveInfo.truncated field.
+				self._hive = Registry.RegistryHiveTruncated(self._primary, allow_partial_results = True)
 
 				self._db_init()
 
@@ -165,7 +166,8 @@ class YarpDB(object):
 			self._db_process_data()
 		else:
 			# Create the truncated hive object.
-			self._hive = Registry.RegistryHiveTruncated(self._primary)
+			# This interface marks partial results explicitly via the HiveInfo.truncated field.
+			self._hive = Registry.RegistryHiveTruncated(self._primary, allow_partial_results = True, is_fragment = self._is_rebuilt)
 
 			self._db_init()
 

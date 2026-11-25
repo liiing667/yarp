@@ -283,7 +283,12 @@ def process_normal_hive(hive):
 				print('---')
 
 def process_truncated_hive(hive):
+	source_record = hive.source_record
+
 	print('Primary file seems to be truncated, only available keys and values will be printed', file = sys.stderr)
+	print('Truncation source record: file size: {} bytes, declared file size: {} bytes, truncation point: {}, missing: {} bytes, scenario: {}'.format(
+		source_record.file_size, source_record.declared_file_size, source_record.truncation_point,
+		source_record.missing_size, source_record.truncation_scenario), file = sys.stderr)
 
 	print('Hive information:')
 	print()
@@ -344,6 +349,7 @@ except RegistryFile.NotSupportedException:
 	temp_obj.close()
 
 	truncated = True
+	fragment = True
 except RegistryFile.BaseBlockException:
 	print('File seems to be a fragment, converting it to a truncated primary file', file = sys.stderr)
 
@@ -352,13 +358,17 @@ except RegistryFile.BaseBlockException:
 	temp_obj.close()
 
 	truncated = True
+	fragment = True
 except Registry.RegistryException:
 	truncated = True
+	fragment = False
 else:
 	truncated = False
+	fragment = False
 
 if truncated:
-	hive = Registry.RegistryHiveTruncated(primary)
+	# This tool is an explicit consumer of partial results: the output is marked with a source record.
+	hive = Registry.RegistryHiveTruncated(primary, allow_partial_results = True, is_fragment = fragment)
 	process_truncated_hive(hive)
 
 	hive = None
@@ -395,7 +405,7 @@ except (RegistryFile.CellOffsetException, RegistryFile.ReadException):
 		raise
 
 	# A truncated dirty hive.
-	hive = Registry.RegistryHiveTruncated(primary)
+	hive = Registry.RegistryHiveTruncated(primary, allow_partial_results = True)
 	process_truncated_hive(hive)
 else:
 	process_normal_hive(hive)
