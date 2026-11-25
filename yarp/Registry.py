@@ -8,6 +8,7 @@ from __future__ import unicode_literals, division
 
 from .RegistryFile import RegistryException, BASE_BLOCK_LENGTH_PRIMARY
 from . import RegistryFile, RegistryRecords, RegistryUnicode
+from .SourceEvidence import make_source_record, publish_source_record
 from struct import unpack
 from datetime import datetime, timedelta
 from collections import namedtuple
@@ -203,15 +204,51 @@ class RegistryHive(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
+	source_record = None
+	"""Stable source identity/evidence shared by accepted reads and rejections."""
+
 	def __init__(self, file_object, tolerate_minor_errors = True):
-		self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+		self.source_record = make_source_record(file_object, 'yarp-hive-source-record')
+
+		try:
+			self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+		except Exception as exc:
+			publish_source_record(self.source_record, 'rejected', 'RegistryHive.__init__', exc)
+			try:
+				exc.source_record = self.source_record
+			except Exception:
+				pass
+			raise
+
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		publish_source_record(self.source_record, 'accepted', 'RegistryHive.__init__')
 
 	def root_key(self):
 		"""Get and return a root key node (a RegistryKey object)."""
 
-		return RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+		try:
+			key = RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+		except Exception as exc:
+			publish_source_record(self.source_record, 'rejected', 'RegistryHive.root_key', exc)
+			try:
+				exc.source_record = self.source_record
+			except Exception:
+				pass
+			raise
+
+		publish_source_record(self.source_record, 'root_key_published', 'RegistryHive.root_key')
+		return key
+
+	def RootKey(self):
+		"""Compatibility alias for public consumers using the .NET-style name."""
+
+		return self.root_key()
+
+	def get_source_record(self):
+		"""Return the stable source record for this hive."""
+
+		return self.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
