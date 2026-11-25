@@ -53,6 +53,22 @@ RegistryRecords.KEY_IS_SUPERSEDE_TREE: 'IsSupersedeTree',
 KEY_FLAG_INHERIT_CLASS = 'InheritClass'
 VALUE_FLAG_TOMBSTONE = 'IsTombstone'
 
+SourceRecord = RegistryFile.HiveSourceRecord
+HiveSourceRecord = RegistryFile.HiveSourceRecord
+SecurityRecord = RegistryFile.SecurityRecord
+
+
+def get_source_records():
+	"""Return source records shared by accepted reads and rejections."""
+
+	return RegistryFile.get_source_records()
+
+
+def get_security_records():
+	"""Compatibility alias for get_source_records()."""
+
+	return RegistryFile.get_security_records()
+
 AutoRecoveryResult = namedtuple('AutoRecoveryResult', [ 'recovered', 'is_new_log', 'file_objects' ])
 
 class WalkException(RegistryException):
@@ -82,6 +98,119 @@ def DecodeFiletime(Timestamp):
 
 	return datetime(1601, 1, 1) + timedelta(microseconds = Timestamp / 10)
 
+class EvidentText(str):
+	"""A text value carrying the exact wire bytes it was decoded from."""
+
+	def __new__(cls, value, raw_bytes = None, encoding = None, evidence = None):
+		obj = super(EvidentText, cls).__new__(cls, value)
+		obj.raw_bytes = raw_bytes
+		obj.encoding = encoding
+		obj.evidence = dict(evidence or {})
+		return obj
+
+	@property
+	def raw_hex(self):
+		if self.raw_bytes is None:
+			return None
+
+		try:
+			return bytes(self.raw_bytes).hex()
+		except Exception:
+			return None
+
+	def evidence_dict(self):
+		result = dict(self.evidence)
+		result.update({
+			'text': str(self),
+			'encoding': self.encoding,
+			'raw_hex': self.raw_hex,
+		})
+		return result
+
+class NameIdentity(object):
+	"""Canonical Windows identity, display text and raw byte evidence."""
+
+	def __init__(self, text, raw_bytes = None, encoding = None, compact_name = None, source_record = None, cell_relative_offset = None, kind = 'key'):
+		self.text = text
+		self.name = text
+		self.display_name = text
+		self.canonical_text = RegistryUnicode.Canonical(text)
+		self.raw_bytes = bytes(raw_bytes) if raw_bytes is not None else b''
+		self.raw_hex = self.raw_bytes.hex()
+		self.encoding = encoding
+		self.compact_name = compact_name
+		self.source_record = source_record
+		self.source_record_id = getattr(source_record, 'record_id', None)
+		self.cell_relative_offset = cell_relative_offset
+		self.kind = kind
+
+	@property
+	def canonical_name(self):
+		return self.canonical_text
+
+	@property
+	def canonical(self):
+		return self.canonical_text
+
+	@property
+	def raw_name(self):
+		return self.raw_bytes
+
+	@property
+	def name_bytes(self):
+		return self.raw_bytes
+
+	def __str__(self):
+		return self.text
+
+	def __eq__(self, other):
+		if isinstance(other, NameIdentity):
+			return self.canonical_text == other.canonical_text
+
+		return self.canonical_text == canonical_identity(other)
+
+	def __ne__(self, other):
+		return not self.__eq__(other)
+
+	def __hash__(self):
+		return hash(self.canonical_text)
+
+	def to_dict(self):
+		return {
+			'kind': self.kind,
+			'text': self.text,
+			'display_name': self.display_name,
+			'canonical_name': self.canonical_text,
+			'canonical_identity': self.canonical_text,
+			'encoding': self.encoding,
+			'compact_name': self.compact_name,
+			'raw_hex': self.raw_hex,
+			'raw_byte_length': len(self.raw_bytes),
+			'cell_relative_offset': self.cell_relative_offset,
+			'source_record': self.source_record_id,
+		}
+
+
+KeyNameIdentity = NameIdentity
+
+
+def canonical_identity(name):
+	"""Return the canonical Windows identity for a key/path/value name."""
+
+	if isinstance(name, NameIdentity):
+		return name.canonical_text
+
+	if name is None:
+		return None
+
+	if isinstance(name, bytes):
+		try:
+			name = name.decode('utf-8')
+		except UnicodeDecodeError:
+			name = DecodeASCII(name)
+
+	return RegistryUnicode.Canonical(name)
+
 def DecodeUnicode(Buffer, RemoveGarbage = False, StrictDecode = False):
 	"""Decode the Unicode (UTF-16LE) string and return it. Surrogate pairs are supported.
 	When 'RemoveGarbage' is True, this function will attempt to sanitize a null-terminated Unicode string.
@@ -93,24 +222,32 @@ def DecodeUnicode(Buffer, RemoveGarbage = False, StrictDecode = False):
 	else:
 		err_resolution = 'replace'
 
+	decoded = None
+	raw_evidence = Buffer
 	if RemoveGarbage and len(Buffer) > 2:
 		# Windows is using null-terminated Unicode strings, so we want to remove garbage, if any, after the end of the string.
 		pos = 0
 		while pos < len(Buffer):
 			two_bytes = Buffer[pos : pos + 2]
 			if two_bytes == b'\x00\x00':
-				return Buffer[ : pos + 2].decode('utf-16le', errors = err_resolution) # Include the null character to the output string.
+				raw_evidence = Buffer[ : pos + 2]
+				decoded = raw_evidence.decode('utf-16le', errors = err_resolution) # Include the null character to the output string.
+				break
 
 			pos += 2
 
-	return Buffer.decode('utf-16le', errors = err_resolution)
+	if decoded is None:
+		decoded = Buffer.decode('utf-16le', errors = err_resolution)
+
+	return EvidentText(decoded, raw_bytes = raw_evidence, encoding = 'utf-16le')
 
 unicode_replacement_character = b'\xfd\xff'.decode('utf-16le')
 
 def DecodeASCII(Buffer):
 	"""Decode the ASCII (extended) string and return it."""
 
-	return Buffer.decode('latin-1') # This is equal to adding a null byte after each character, and then running .decode('utf-16le').
+	decoded = Buffer.decode('latin-1') # This is equal to adding a null byte after each character, and then running .decode('utf-16le').
+	return EvidentText(decoded, raw_bytes = Buffer, encoding = 'latin-1')
 
 def DecodeUnicodeMulti(Buffer, RemoveGarbage = False):
 	"""Decode the Unicode (UTF-16LE) array of null-terminated strings and return it as is.
@@ -203,15 +340,61 @@ class RegistryHive(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object, tolerate_minor_errors = True):
-		self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+	source_record = None
+	"""The source identity and validation/audit record for this hive."""
+
+	def __init__(self, file_object, tolerate_minor_errors = True, security_record_path = None, source_record = None):
+		if source_record is not None:
+			self.source_record = source_record
+		else:
+			self.source_record = RegistryFile.HiveSourceRecord(file_object, receipt_path = security_record_path)
+
+		self.security_record = self.source_record
+		self.source_record.record_event('registry_hive_open_started', tolerate_minor_errors = tolerate_minor_errors)
+
+		try:
+			self.registry_file = RegistryFile.PrimaryFile(file_object, tolerate_minor_errors)
+			self.registry_file.source_record = self.source_record
+		except Exception as exc:
+			self.source_record.mark_rejected(exc, 'RegistryHive.__init__')
+			self.source_record.publish(security_record_path)
+			raise
+
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		self.source_record.mark_accepted('RegistryHive.__init__')
+		self.source_record.publish(security_record_path)
 
 	def root_key(self):
 		"""Get and return a root key node (a RegistryKey object)."""
 
-		return RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+		try:
+			root_key = RegistryKey(self.registry_file, self.registry_file.get_root_cell(), 0, self.registry_file.baseblock.effective_root_cell_offset, self.tolerate_minor_errors)
+			root_key.source_record = self.source_record
+			root_identity = root_key.name_identity()
+			self.source_record.record_name_identity(root_identity)
+			self.source_record.record_event('root_key_published', root_cell_offset = self.registry_file.baseblock.effective_root_cell_offset)
+			self.source_record.publish()
+			return root_key
+		except Exception as exc:
+			self.source_record.mark_rejected(exc, 'RegistryHive.root_key')
+			self.source_record.publish()
+			raise
+
+	def RootKey(self):
+		"""Compatibility alias for callers using the structure/concept name."""
+
+		return self.root_key()
+
+	def get_source_record(self):
+		"""Return the source record shared by accepted reads and rejections."""
+
+		return self.source_record
+
+	def get_security_record(self):
+		"""Compatibility alias for get_source_record()."""
+
+		return self.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
@@ -440,6 +623,27 @@ class RegistryKey(object):
 		self.layer = layer
 		self.tolerate_minor_errors = tolerate_minor_errors
 		self.effective_slack = set()
+		self.source_record = getattr(primary_file, 'source_record', None)
+		self.security_record = self.source_record
+		self._name_identity = None
+
+	def _bind_read_exception(self, exc, stage):
+		"""Attach the shared source record to a read/walk rejection."""
+
+		record = self.source_record or getattr(self.registry_file, 'source_record', None)
+		if record is not None:
+			self.source_record = record
+			self.security_record = record
+			record.bind_exception(exc, stage)
+			record.publish()
+		else:
+			try:
+				exc.source_record = None
+				exc.security_record = None
+			except Exception:
+				pass
+
+		return exc
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
@@ -457,6 +661,34 @@ class RegistryKey(object):
 	def name(self):
 		"""Get, decode and return a key name string."""
 
+		return self.name_identity().text
+
+	def name_raw(self):
+		"""Return the exact raw key-name bytes from the KeyNode record."""
+
+		return self.key_node.get_key_name()
+
+	# Common evidence-oriented aliases.
+	raw_name = name_raw
+	raw_key_name = name_raw
+	name_bytes = name_raw
+
+	def canonical_name(self):
+		"""Return the canonical Windows case/Unicode identity of this name."""
+
+		return self.name_identity().canonical_text
+
+	def canonical_key(self):
+		"""Compatibility alias for canonical_name()."""
+
+		return self.canonical_name()
+
+	def name_identity(self):
+		"""Return the canonical identity and raw byte evidence for this key."""
+
+		if self._name_identity is not None:
+			return self._name_identity
+
 		name_buf = self.key_node.get_key_name()
 		is_ascii = self.registry_file.baseblock.effective_version > 1 and self.key_node.get_flags() & RegistryRecords.KEY_COMP_NAME > 0
 		if is_ascii:
@@ -466,12 +698,65 @@ class RegistryKey(object):
 
 		if name.find('\\') != -1:
 			if not self.naive:
-				raise WalkException('Key node does not have a valid name, key path: {}'.format(self.path()))
+				try:
+					key_path = self.path()
+				except RegistryException:
+					key_path = '<unavailable path>'
+				exc = WalkException('Key node does not have a valid name, key path: {}'.format(key_path))
 			else:
 				# Do not build the path, if we are trying to recover a key node.
-				raise WalkException('Key node does not have a valid name')
+				exc = WalkException('Key node does not have a valid name')
 
-		return name
+			self._bind_read_exception(exc, 'RegistryKey.name')
+			raise exc
+
+		identity = NameIdentity(
+			name,
+			raw_bytes = name_buf,
+			encoding = 'latin-1' if is_ascii else 'utf-16le',
+			compact_name = bool(is_ascii),
+			source_record = self.source_record,
+			cell_relative_offset = self.cell_relative_offset,
+			kind = 'key',
+		)
+		name.name_identity = identity
+		self._name_identity = identity
+		return identity
+
+	def path_identity(self, show_root = False):
+		"""Return display/canonical path identities and component evidence."""
+
+		components = []
+		key = self
+		track = set()
+		if getattr(self, 'naive', False):
+			track.add(self.key_node.get_parent())
+
+		while key is not None:
+			identity = key.name_identity()
+			components.append(identity)
+			parent = key.parent()
+			if parent is not None and getattr(key, 'naive', False):
+				parent_offset = parent.key_node.get_parent()
+				if parent_offset in track:
+					raise self._bind_read_exception(WalkException('Invalid path when following parent keys'), 'RegistryKey.path_identity')
+				track.add(parent_offset)
+			key = parent
+
+		components.reverse()
+		if not show_root:
+			components = components[1 : ]
+
+		display_path = '\\'.join([ item.text for item in components ])
+		canonical_path = '\\'.join([ item.canonical_text for item in components ])
+		return {
+			'display_path': display_path,
+			'path': display_path,
+			'canonical_path': canonical_path,
+			'canonical_identity': canonical_path,
+			'components': [ item.to_dict() for item in components ],
+			'source_record': getattr(self.source_record, 'record_id', None),
+		}
 
 	def classname(self):
 		"""Get, decode and return a class name string."""
@@ -568,6 +853,15 @@ class RegistryKey(object):
 
 	def subkeys(self):
 		"""This method yields subkeys (RegistryKey objects)."""
+
+		try:
+			yield from self._subkeys_impl()
+		except Exception as exc:
+			self._bind_read_exception(exc, 'RegistryKey.subkeys')
+			raise
+
+	def _subkeys_impl(self):
+		"""Implementation of subkey traversal and identity validation."""
 
 		subkeys_names = set()
 
@@ -700,9 +994,9 @@ class RegistryKey(object):
 	def subkey(self, name):
 		"""This method returns a subkey by its name (a RegistryKey object) or None, if not found."""
 
-		name = name.upper()
+		name = canonical_identity(name)
 		for curr_subkey in self.subkeys():
-			curr_name = curr_subkey.name().upper()
+			curr_name = curr_subkey.canonical_name()
 			if name == curr_name:
 				return curr_subkey
 
@@ -713,6 +1007,15 @@ class RegistryKey(object):
 
 	def values(self):
 		"""This method yields key values (RegistryValue objects)."""
+
+		try:
+			yield from self._values_impl()
+		except Exception as exc:
+			self._bind_read_exception(exc, 'RegistryKey.values')
+			raise
+
+	def _values_impl(self):
+		"""Implementation of value traversal and identity validation."""
 
 		values_names = set()
 
@@ -796,9 +1099,9 @@ class RegistryKey(object):
 		Remnant values are ignored by this method.
 		"""
 
-		name = name.upper()
+		name = canonical_identity(name)
 		for curr_value in self.values():
-			curr_name = curr_value.name().upper()
+			curr_name = curr_value.canonical_name()
 			if name == curr_name:
 				return curr_value
 
@@ -885,6 +1188,8 @@ class RegistryValue(object):
 
 		self.key_value = RegistryRecords.KeyValue(buf)
 		self.cell_relative_offset = None # This is set externally.
+		self.source_record = getattr(primary_file, 'source_record', None)
+		self.security_record = self.source_record
 
 	def name(self):
 		"""Get, decode and return a value name string."""
@@ -895,6 +1200,19 @@ class RegistryValue(object):
 			return DecodeASCII(name_buf)
 
 		return DecodeUnicode(name_buf)
+
+	def name_raw(self):
+		"""Return the exact raw value-name bytes from the KeyValue record."""
+
+		return self.key_value.get_value_name()
+
+	raw_name = name_raw
+	name_bytes = name_raw
+
+	def canonical_name(self):
+		"""Return the canonical Windows case/Unicode identity of this value."""
+
+		return canonical_identity(self.name())
 
 	def type_raw(self):
 		"""Get and return a value type (as an integer)."""
@@ -1066,9 +1384,30 @@ class RegistryHiveTruncated(object):
 	effective_slack = None
 	"""A set of data strings from different slack space locations to be used in the deleted data recovery."""
 
-	def __init__(self, file_object):
-		self.registry_file = RegistryFile.PrimaryFileTruncated(file_object)
+	def __init__(self, file_object, security_record_path = None, source_record = None):
+		if source_record is not None:
+			self.source_record = source_record
+		else:
+			self.source_record = RegistryFile.HiveSourceRecord(file_object, receipt_path = security_record_path)
+
+		self.security_record = self.source_record
+		try:
+			self.registry_file = RegistryFile.PrimaryFileTruncated(file_object)
+			self.registry_file.source_record = self.source_record
+		except Exception as exc:
+			self.source_record.mark_rejected(exc, 'RegistryHiveTruncated.__init__')
+			self.source_record.publish(security_record_path)
+			raise
+
 		self.effective_slack = set()
+		self.source_record.mark_accepted('RegistryHiveTruncated.__init__')
+		self.source_record.publish(security_record_path)
+
+	def get_source_record(self):
+		return self.source_record
+
+	def get_security_record(self):
+		return self.source_record
 
 	def last_written_timestamp(self):
 		"""Get, decode and return a last written timestamp (a datetime object)."""
@@ -1174,6 +1513,19 @@ class StandaloneRegistryKey(object):
 			raise WalkException('Key node does not have a valid name')
 
 		return name
+
+	def name_raw(self):
+		"""Return the exact raw key-name bytes."""
+
+		return self.key_node.get_key_name()
+
+	raw_name = name_raw
+	name_bytes = name_raw
+
+	def canonical_name(self):
+		"""Return the canonical Windows case/Unicode identity of this name."""
+
+		return canonical_identity(self.name())
 
 	def subkeys_count(self):
 		"""Get and return a number of subkeys. Volatile subkeys are not counted."""

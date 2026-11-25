@@ -359,6 +359,16 @@ class KeyNode(MemoryBlock):
 
 		return self.read_binary(76, self.get_key_name_length())
 
+	def get_key_name_raw(self):
+		"""Compatibility alias returning the raw key name bytes."""
+
+		return self.get_key_name()
+
+	def get_raw_key_name(self):
+		"""Compatibility alias returning the raw key name bytes."""
+
+		return self.get_key_name()
+
 	def get_slack(self):
 		return self.read_binary(76 + self.get_key_name_length())
 

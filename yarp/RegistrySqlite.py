@@ -5,7 +5,7 @@
 # Unlike the Registry module, this interface provides a single class to work with a registry hive, a truncated registry hive, and a registry fragment.
 # Python 3 only.
 
-from . import Registry, RegistryFile, RegistryRecover, RegistryHelpers
+from . import Registry, RegistryFile, RegistryRecover, RegistryHelpers, RegistryUnicode
 import sqlite3
 import os
 from hashlib import sha256
@@ -19,7 +19,13 @@ HiveInfo = namedtuple('HiveInfo', [ 'last_written_timestamp', 'last_reorganized_
 def sqlite3_upper_unicode(string):
 	"""The UPPER()-like function with Unicode support."""
 
-	return string.upper()
+	if string is None:
+		return None
+
+	# Use the same Windows upcase identity as key/value matching and ordering;
+	# Python's full Unicode upper() can collapse distinct extended names
+	# (for example, U+00DF and "SS").
+	return RegistryUnicode.Canonical(string)
 
 class YarpDB(object):
 	"""This is an implementation of a registry hive to an sqlite3 database converter (and a simple interface to the database)."""

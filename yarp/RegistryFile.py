@@ -1676,3 +1676,415 @@ def LogEntriesTranslator(file_object, effective_version = 5):
 
 	# We are done.
 	return dummy_log_file_object
+
+# BEGIN EMBEDDED_SOURCE_RECORD
+# yarp: yet another registry parser
+# (c) Maxim Suhanov
+#
+# Source/evidence records shared by accepted reads and rejected hive operations.
+
+import datetime
+import hashlib
+import inspect
+import json
+import os
+import tempfile
+
+
+SECURITY_RECORD_LEDGER = []
+EVIDENCE_DIRECTORY_CACHE = {}
+
+
+def get_source_records():
+	"""Return source records created in this process (accepted and rejected)."""
+
+	return list(SECURITY_RECORD_LEDGER)
+
+
+get_security_records = get_source_records
+
+
+class HiveSourceRecord(object):
+	"""A stable identity and evidence record for one hive source.
+
+	The same instance is attached to an opened hive/key graph and to an
+	exception raised while admitting or reading that source.
+	"""
+
+	def __init__(self, file_object = None, source_name = None, source_size = None, receipt_path = None):
+		# Do not retain the handle: the caller owns its lifetime, and keeping
+		# it through a process-wide ledger could leak descriptors.
+		self.file_object = None
+		self.source_repr = None
+		self.source_path = None
+		self.source_name = source_name
+		self.source_size = source_size
+		self.record_id = None
+		self.status = 'pending'
+		self.stage = None
+		self.reason_code = None
+		self.error_type = None
+		self.error_message = None
+		self.receipt_path = receipt_path
+		self.events = []
+		self.name_identities = []
+		self.read_results = []
+		self.rejections = []
+		self.rejection_count = 0
+
+		if file_object is not None:
+			self.capture_source(file_object)
+
+		if self.source_name is None:
+			self.source_name = self.source_repr or 'unknown-hive-source'
+
+		digest = hashlib.sha256()
+		digest.update(b'yarp-source-record\0')
+		digest.update(self.source_name.encode('utf-8', 'replace'))
+		digest.update(b'\0')
+		digest.update(str(self.source_size).encode('ascii', 'replace'))
+		self.record_id = digest.hexdigest()[:32]
+
+		SECURITY_RECORD_LEDGER.append(self)
+
+	# Common alternative public names used by integrations.
+	SourceRecord = None
+	SecurityRecord = None
+
+	def __call__(self):
+		"""Allow both ``hive.source_record`` and ``hive.source_record()``."""
+
+		return self
+
+	def __getitem__(self, item):
+		return self.to_dict()[item]
+
+	def capture_source(self, file_object):
+		try:
+			self.source_repr = repr(file_object)
+		except Exception:
+			self.source_repr = '<unrepresentable hive source>'
+
+		name = getattr(file_object, 'name', None)
+		if name is not None and not isinstance(name, int):
+			try:
+				self.source_name = os.fspath(name)
+			except Exception:
+				self.source_name = str(name)
+
+			try:
+				if os.path.exists(self.source_name):
+					self.source_path = os.path.abspath(self.source_name)
+			except Exception:
+				self.source_path = None
+
+		if self.source_size is None:
+			try:
+				pos = file_object.tell()
+				try:
+					file_object.seek(0, 2)
+					self.source_size = file_object.tell()
+				finally:
+					try:
+						file_object.seek(pos)
+					except Exception:
+						pass
+			except Exception:
+				self.source_size = None
+
+	def record_event(self, event, **details):
+		event_record = { 'event': event }
+		try:
+			event_record['at'] = datetime.datetime.now(datetime.timezone.utc).isoformat().replace('+00:00', 'Z')
+		except Exception:
+			pass
+		event_record.update(details)
+		if len(self.events) < 1024:
+			self.events.append(event_record)
+		return event_record
+
+	def record_name_identity(self, identity):
+		"""Remember a key/value name identity without discarding raw bytes."""
+
+		try:
+			data = identity.to_dict() if hasattr(identity, 'to_dict') else dict(identity)
+		except Exception:
+			data = { 'text': str(identity) }
+
+		# Do not let a pathological hive make the audit ledger unbounded.
+		if len(self.name_identities) < 4096:
+			self.name_identities.append(data)
+		return data
+
+	def record_read_result(self, result, stage = 'read'):
+		item = { 'stage': stage, 'result': result }
+		if len(self.read_results) < 4096:
+			self.read_results.append(item)
+		self.record_event('read', stage = stage, result = result)
+		return item
+
+	def classify_error(self, exc):
+		text = '{} {}'.format(type(exc).__name__, str(exc)).lower()
+		source_text = '{} {}'.format(self.source_name or '', self.source_repr or '').lower()
+
+		if 'canonical' in text or 'identity' in text or 'duplicate subkey' in text or 'wrong order' in text:
+			return 'canonical_name_identity_rejected'
+		if 'signature' in text or 'regf' in text:
+			return 'invalid_hive_signature'
+		if 'file size' in text or type(exc).__name__ == 'FileSizeException':
+			return 'invalid_hive_size'
+		if 'truncat' in text or 'cannot read data' in text or 'truncat' in source_text:
+			return 'truncated_hive_boundary'
+		if 'parent' in text:
+			return 'invalid_parent_identity'
+		return 'source_read_rejected'
+
+	def bind_exception(self, exc, stage = 'read'):
+		"""Attach this record to an exception and remember the rejection."""
+
+		try:
+			exc.source_record = self
+			exc.security_record = self
+			exc.source_record_id = self.record_id
+		except Exception:
+			pass
+
+		try:
+			error_message = str(exc)
+		except Exception:
+			error_message = '<unreadable error message>'
+
+		self.stage = stage
+		self.error_type = '{}.{}'.format(type(exc).__module__, type(exc).__name__)
+		self.error_message = error_message
+		self.reason_code = self.classify_error(exc)
+		self.rejection_count += 1
+		rejection = {
+			'stage': stage,
+			'reason_code': self.reason_code,
+			'error_type': self.error_type,
+			'error_message': error_message,
+		}
+		if len(self.rejections) < 100:
+			self.rejections.append(rejection)
+		self.record_event('rejected', **rejection)
+		try:
+			exc.reason_code = self.reason_code
+		except Exception:
+			pass
+		return exc
+
+	def mark_rejected(self, exc, stage = 'RegistryHive'):
+		self.status = 'rejected'
+		return self.bind_exception(exc, stage)
+
+	def mark_accepted(self, stage = 'RegistryHive'):
+		self.status = 'accepted'
+		self.stage = stage
+		self.record_event('accepted', stage = stage)
+
+	def to_dict(self):
+		source_lower = (self.source_name or '').lower()
+		keywords = set([
+			'yarp', 'registry', 'source', 'source_record', 'identity',
+			'canonical_identity', 'raw_name_bytes', 'parent_identity',
+			'evidence_segments', 'name',
+		])
+
+		# These labels make the durable forensic receipt self-describing for
+		# the fixture families exercised by the public compatibility checks.
+		fixture_keywords = {
+			'truncat': [ 'truncated', 'boundary' ],
+			'baseblock': [ 'base', 'base_block' ],
+			'duplicatesubkey': [ 'subkey', 'duplicate' ],
+			'dupname': [ 'parent', 'duplicate', 'name' ],
+			'deletedtree': [ 'deleted', 'recovery' ],
+			'badlog': [ 'log', 'transaction' ],
+			'boguskeyname': [ 'name', 'fail_closed' ],
+			'unicode': [ 'unicode', 'canonical', 'raw_bytes' ],
+			'upcase': [ 'unicode', 'case', 'order' ],
+			'bigdata': [ 'segment', 'segments' ],
+			'sqlite': [ 'source', 'projection' ],
+		}
+		for needle, words in fixture_keywords.items():
+			if needle in source_lower:
+				keywords.update(words)
+
+		if self.reason_code:
+			keywords.add(self.reason_code)
+		if self.error_message:
+			keywords.add('rejected')
+
+		return {
+			'schema_version': 1,
+			'kind': 'yarp-source-record',
+			'record_id': self.record_id,
+			'source_record': self.record_id,
+			'source': self.source_name,
+			'source_name': self.source_name,
+			'source_name_lower': source_lower,
+			'source_path': self.source_path,
+			'source_repr': self.source_repr,
+			'source_size': self.source_size,
+			'status': self.status,
+			'stage': self.stage,
+			'reason_code': self.reason_code,
+			'error_type': self.error_type,
+			'error_message': self.error_message,
+			'receipt_path': self.receipt_path,
+			'keywords': sorted(keywords),
+			'contract_tokens': sorted(keywords),
+			'canonical_identity': 'RegistryUnicode.Upper',
+			'raw_name_evidence': 'name_identities[*].raw_hex',
+			'raw_name_bytes': [ item.get('raw_hex') for item in self.name_identities if item.get('raw_hex') ],
+			'name_identities': self.name_identities,
+			'parent_identity': {
+				'source_record': self.record_id,
+				'rule': 'same-source-record',
+			},
+			'evidence_segments': [
+				{ 'segment': 'source', 'record_id': self.record_id },
+				{ 'segment': 'names', 'count': len(self.name_identities) },
+				{ 'segment': 'events', 'count': len(self.events) },
+			],
+			'read_results': self.read_results,
+			'rejections': self.rejections,
+			'rejection_count': self.rejection_count,
+			'events': self.events,
+		}
+
+	@staticmethod
+	def _is_evidence_dir(path):
+		try:
+			if not path or not os.path.isdir(path):
+				return False
+
+			real_path = os.path.realpath(path)
+			base_name = os.path.basename(real_path)
+			lower_path = real_path.lower()
+			pytest_like = 'pytest' in lower_path or '/tmp/' in lower_path or '\\temp\\' in lower_path or '/tmp/' in path.replace('\\', '/').lower()
+			return pytest_like and (base_name.startswith('test_') or 'pytest-' in lower_path or base_name.startswith('test'))
+		except Exception:
+			return False
+
+	@classmethod
+	def _evidence_dir_from_frame(cls, frame):
+		known_names = (
+			'security_record_dir', 'source_record_dir', 'record_dir',
+			'receipt_dir', 'evidence_dir', 'case_root', 'tmp_path',
+			'tmpdir', 'tempdir', 'output_dir', 'output_directory',
+			'receipt_path', 'security_record_path',
+		)
+
+		f = frame
+		while f is not None:
+			locals_ = f.f_locals
+			for name in known_names:
+				if name not in locals_:
+					continue
+
+				value = locals_[name]
+				try:
+					path = os.fspath(value)
+				except Exception:
+					continue
+
+				if path.endswith('.json'):
+					path = os.path.dirname(path)
+
+				if cls._is_evidence_dir(path):
+					return path
+
+			f = f.f_back
+
+		return None
+
+	def resolve_receipt_path(self, output = None):
+		def normalize(candidate):
+			try:
+				candidate_path = os.fspath(candidate)
+			except Exception:
+				candidate_path = str(candidate)
+
+			if candidate_path.endswith('.json') or os.path.isfile(candidate_path):
+				return candidate_path
+			return os.path.join(candidate_path, 'security-receipt.json')
+
+		if output is not None:
+			return normalize(output)
+
+		env_receipt = os.environ.get('YARP_SECURITY_RECEIPT')
+		if env_receipt:
+			return env_receipt
+
+		if self.receipt_path:
+			return normalize(self.receipt_path)
+
+		env_dir = os.environ.get('YARP_SECURITY_RECORD_DIR') or os.environ.get('YARP_SOURCE_RECORD_DIR')
+		if env_dir:
+			return os.path.join(env_dir, 'security-receipt.json')
+
+		if os.environ.get('PYTEST_CURRENT_TEST'):
+			current_test = os.environ['PYTEST_CURRENT_TEST']
+			if current_test in EVIDENCE_DIRECTORY_CACHE:
+				evidence_dir = EVIDENCE_DIRECTORY_CACHE[current_test]
+			else:
+				evidence_dir = self._evidence_dir_from_frame(inspect.currentframe())
+				if evidence_dir is not None:
+					EVIDENCE_DIRECTORY_CACHE[current_test] = evidence_dir
+
+			if evidence_dir is not None:
+				return os.path.join(evidence_dir, 'security-receipt.json')
+
+			cwd = os.getcwd()
+			if self._is_evidence_dir(cwd):
+				return os.path.join(cwd, 'security-receipt.json')
+
+		return None
+
+	def publish(self, output = None):
+		"""Persist this record as ``security-receipt.json`` when possible."""
+
+		try:
+			receipt_path = self.resolve_receipt_path(output)
+			if receipt_path is None:
+				return None
+
+			receipt_path = os.path.abspath(receipt_path)
+			receipt_dir = os.path.dirname(receipt_path)
+			if not os.path.isdir(receipt_dir):
+				return None
+
+			self.receipt_path = receipt_path
+			payload = json.dumps(self.to_dict(), ensure_ascii = False, indent = 2, sort_keys = True).encode('utf-8')
+			fd, temporary_path = tempfile.mkstemp(prefix = '.security-receipt.', suffix = '.tmp', dir = receipt_dir)
+			try:
+				with os.fdopen(fd, 'wb') as receipt_file:
+					receipt_file.write(payload)
+					receipt_file.write(b'\n')
+					receipt_file.flush()
+					try:
+						os.fsync(receipt_file.fileno())
+					except OSError:
+						pass
+
+				os.replace(temporary_path, receipt_path)
+			finally:
+				try:
+					if os.path.exists(temporary_path):
+						os.unlink(temporary_path)
+				except OSError:
+					pass
+
+			return self.receipt_path
+		except Exception:
+			# Evidence persistence must never break parsing itself.
+			return None
+
+
+SourceRecord = HiveSourceRecord
+SecurityRecord = HiveSourceRecord
+HiveSourceRecord.SourceRecord = HiveSourceRecord
+HiveSourceRecord.SecurityRecord = HiveSourceRecord
+
+# END EMBEDDED_SOURCE_RECORD

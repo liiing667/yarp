@@ -5827,3 +5827,20 @@ def Upper(Str):
 	"""
 
 	return Str.translate(TRANSLATION_DICT)
+
+
+def Canonical(Str):
+	"""Return the canonical registry name identity.
+
+	This is intentionally the Windows upcase identity, not Python's full
+	Unicode case folding/upper mapping: the latter can collapse names which
+	Windows keeps distinct (for example, U+00DF and "SS").
+	"""
+
+	return Upper(Str)
+
+
+def SameName(First, Second):
+	"""Return whether two names have the same canonical registry identity."""
+
+	return Canonical(First) == Canonical(Second)
