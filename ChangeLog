@@ -1,5 +1,7 @@
 Version: 1.0.33
 
+RegistrySqlite: preserve the source (live vs. recovered/deleted) and a full path identity of each key, so a recovered key is never silently merged with a live key of the same name; same-named keys under different parents and independent copies of a deleted node remain distinct records.
+RegistryRecover: attach the physical location of a recovered key node.
 yarp-print: print deleted values correctly when dealing with truncated hives, print remnant value data (having no corresponding deleted key value).
 RegistryRecover: handle remnant value data.
 

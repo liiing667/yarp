@@ -91,7 +91,7 @@ class Scanner(object):
 
 		return data
 
-	def process_cell(self, cell):
+	def process_cell(self, cell, cell_location = None):
 		"""Scan data of a cell for deleted keys and values, yield them as RegistryKey, RegistryValue objects, bytes.
 		Note: only even offsets will be scanned.
 		"""
@@ -132,6 +132,10 @@ class Scanner(object):
 					except (Registry.RegistryException, UnicodeDecodeError, ValueError, OverflowError):
 						pass
 					else:
+						# Record the physical location of this recovered key node: the relative
+						# offset of the free cell containing it (None for remnant data or slack
+						# space) and the position of the node within the scanned data.
+						key.recover_location = (cell_location, pos)
 						yield key
 
 						unknown_data_end = pos
@@ -200,7 +204,10 @@ class Scanner(object):
 			except Registry.RegistryException:
 				continue
 
-			for result in self.process_cell(cell):
+			# Pass the physical location (a relative cell offset) to the scanner.
+			cell_location = file_offset - RegistryFile.BASE_BLOCK_LENGTH_PRIMARY
+
+			for result in self.process_cell(cell, cell_location):
 				if type(result) is bytes and not self.yield_remnant_bytes:
 					continue
 

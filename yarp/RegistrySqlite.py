@@ -262,18 +262,223 @@ class YarpDB(object):
 		self._value_id = 0
 		self._root_found = False
 
-	def _db_key_to_id(self, key, is_deleted = 0):
-		"""Calculate and return the ID for a key."""
+	def _db_key_to_id(self, key, is_deleted = 0, visited_offsets = None):
+		"""Calculate and return the ID for a key.
+
+		A key identity is composed of:
+		 - the source of the key (a live key or a recovered/deleted key);
+		 - the identity of its parent key (a full path identity);
+		 - the complete binary image of its key node.
+
+		This keeps a key recovered from a deleted tree distinct from a live key having the same
+		name (and even the same key node image), while still distinguishing keys sharing a name
+		under different parent keys. Two independent records (for example, two copies of the same
+		deleted key node found in different free cells) remain distinct records as well.
+		"""
 
 		hasher = sha256()
 
-		deleted_status = str(is_deleted).encode()
-		hasher.update(deleted_status)
+		# The source (live vs. recovered/deleted) is part of the identity.
+		hasher.update(b'source:')
+		hasher.update(str(is_deleted).encode())
+		hasher.update(b'\x00')
 
+		# The parent identity (a full path) is part of the identity.
+		if visited_offsets is None:
+			visited_offsets = set()
+
+		parent_key_id = self._db_parent_key_id(key, is_deleted, visited_offsets)
+		if parent_key_id is not None:
+			hasher.update(b'parent:')
+			hasher.update(parent_key_id.encode())
+			hasher.update(b'\x00')
+		else:
+			hasher.update(b'parent:none\x00')
+
+		# The complete binary image of this key node (including its name) is part of the identity.
 		key_node_data = key.key_node.read_binary(0, 76 + key.key_node.get_key_name_length())
+		hasher.update(b'node:')
 		hasher.update(key_node_data)
 
+		# The physical location (when known) disambiguates independent records sharing
+		# the same source, parent identity and key node image.
+		key_location = self._db_key_location(key)
+		if key_location is not None:
+			hasher.update(b'\x00location:')
+			hasher.update(str(key_location).encode())
+
 		return hasher.hexdigest()
+
+	def _db_key_location(self, key):
+		"""Return a physical location identifier for a key (when available), else None.
+
+		The location is never used to distinguish key identities along a reconstructed parent
+		chain (a parent node may be reached either through a free cell or directly through a
+		parent pointer, both yielding the same node). It only disambiguates independent records
+		that share a source, a parent identity and a key node image (for example, two copies of
+		the same deleted node found in different free cells or in remnant/slack data).
+		"""
+
+		return getattr(key, 'recover_location', None)
+
+	def _db_find_recover_location(self, parent_key, parent_node_offset):
+		"""Map a parent node offset (from a parent pointer) to a scanner-side recover location.
+
+		Return None when the parent is not a recovered record (for example, a live key) or when no
+		free cell contains a node at this offset. A node embedded in a free cell after its first
+		node is located by its position within that cell.
+		"""
+
+		if not hasattr(self, '_recover_locations_cache'):
+			self._recover_locations_cache = {}
+
+			scanner = RegistryRecover.Scanner(self._hive)
+			for item in scanner.scan():
+				if type(item) is not Registry.RegistryKey:
+					continue
+
+				location = getattr(item, 'recover_location', None)
+				if location is None:
+					continue
+
+				cell_location, position = location
+				if cell_location is None:
+					# Remnant data or slack space: no free cell offset can be matched.
+					continue
+
+				node_data = item.key_node.read_binary(0, 76 + item.key_node.get_key_name_length())
+				self._recover_locations_cache.setdefault(cell_location, []).append((position, location, node_data))
+
+		cell_locations = self._recover_locations_cache
+
+		parent_node_data = parent_key.key_node.read_binary(0, 76 + parent_key.key_node.get_key_name_length())
+
+		# A parent pointer may point to the cell start (a node at position 0) or directly to an
+		# embedded node (a position past the cell size field). Inspect every recovered cell that
+		# could contain the referenced node and match the node image.
+		for cell_location, entries in cell_locations.items():
+			# A parent pointer refers to the beginning of a cell (its size field), so the
+			# referenced node must be at or after the start of this free cell.
+			if parent_node_offset < cell_location:
+				continue
+
+			# The referenced offset must lie within the cell (at its start or inside it).
+			try:
+				cell = self._hive.registry_file.get_cell_naive(cell_location)
+			except Registry.RegistryException:
+				continue
+
+			if parent_node_offset - cell_location > len(cell):
+				continue
+
+			for position, location, node_data in entries:
+				if node_data == parent_node_data:
+					return location
+
+		return None
+
+	def _db_parent_key_id(self, key, is_deleted = 0, visited_offsets = None):
+		"""Resolve the parent key of 'key' and return its ID (or None, when there is no valid parent).
+
+		The same source (live vs. recovered/deleted) and parent-resolution rules are used here
+		and in '_db_add_key', so a key read from the database and a key rejected as a duplicate
+		share an identical source record.
+		"""
+
+		parent_key_id, is_root = self._db_resolve_parent_chain(key, is_deleted, visited_offsets)
+		if is_root:
+			return None
+
+		return parent_key_id
+
+	def _db_resolve_parent_chain(self, key, is_deleted, visited_offsets):
+		"""Walk the parent chain of 'key' and return (parent_key_id, is_root).
+
+		Cyclic chains and unvalidatable parents yield (None, False); a root key yields (None, True).
+		"""
+
+		if visited_offsets is None:
+			visited_offsets = set()
+
+		try:
+			parent_key = key.parent()
+		except (Registry.RegistryException, UnicodeDecodeError, ValueError, OverflowError):
+			if (not self._is_hive_truncated) and (not is_deleted):
+				raise
+
+			return (None, False)
+
+		if parent_key is None:
+			# This is a root key.
+			return (None, True)
+
+		# Carry the scanner-side location of the parent node when the child was produced by the
+		# recovery scanner and the parent is reached through its parent pointer: both describe the
+		# same physical record, so its identity must be calculated in the same way.
+		child_recover_location = getattr(key, 'recover_location', None)
+		if child_recover_location is not None and getattr(parent_key, 'recover_location', None) is None:
+			parent_node_offset = key.key_node.get_parent()
+			if parent_node_offset != RegistryFile.CELL_OFFSET_NIL:
+				parent_recover_location = self._db_find_recover_location(parent_key, parent_node_offset)
+				if parent_recover_location is not None:
+					parent_key.recover_location = parent_recover_location
+
+		# Guard against cyclic parent chains.
+		parent_offset = parent_key.key_node.get_parent()
+		# A self-referencing parent pointer (the parent node occupies the same cell as the key
+		# node itself) is invalid.
+		if key.cell_relative_offset is not None and parent_key.cell_relative_offset == key.cell_relative_offset:
+			return (None, False)
+
+		# A recovered key reached through a parent pointer has no cell offset: compare the node
+		# images to detect a self-referencing pointer in a truncated or rebuilt hive.
+		if key.cell_relative_offset is None:
+			key_node_data = key.key_node.read_binary(0, 76 + key.key_node.get_key_name_length())
+			parent_node_data = parent_key.key_node.read_binary(0, 76 + parent_key.key_node.get_key_name_length())
+			if parent_node_data == key_node_data:
+				return (None, False)
+
+		if parent_offset in visited_offsets:
+			return (None, False)
+
+		visited_offsets = visited_offsets | { parent_offset }
+
+		parent_key_offset = parent_key.cell_relative_offset + RegistryFile.BASE_BLOCK_LENGTH_PRIMARY
+		if ((not self._is_hive_truncated) and parent_key_offset in self._hive.registry_file.cell_map_referenced) or \
+			(self._is_hive_truncated and parent_key_offset in self._hive.registry_file.cell_map_allocated):
+			parent_key_status = 0
+		else:
+			parent_key_status = 1
+
+		# Validate a deleted parent key.
+		if parent_key_status:
+			try:
+				RegistryRecover.ValidateKey(parent_key)
+			except (Registry.RegistryException, UnicodeDecodeError, ValueError, OverflowError):
+				return (None, False)
+
+		return (self._db_key_to_id(parent_key, parent_key_status, visited_offsets), False)
+
+	def _db_resolve_parent(self, key, is_deleted = 0):
+		"""Resolve the parent of a key using a single set of source rules.
+
+		Return a tuple (parent_key_id, is_root). 'parent_key_id' is None for a root key and for
+		a key whose parent cannot be validated. The same rules are used when calculating a key
+		identity (see '_db_key_to_id') and when storing a key row, so reading a stored key and
+		rejecting a duplicate record never disagree about the source (live vs. deleted) or the
+		full path identity.
+		"""
+
+		parent_key_id, is_root = self._db_resolve_parent_chain(key, is_deleted, set())
+
+		if is_root or parent_key_id is None:
+			return (parent_key_id, is_root)
+
+		# An invalid parent key (one sharing an identity with its child) cannot be trusted.
+		if parent_key_id == self._db_key_to_id(key, is_deleted):
+			return (None, False)
+
+		return (parent_key_id, False)
 
 	def _db_value_to_id(self, value, is_deleted = 0):
 		"""Calculate and return the ID for a value. This should preserve the original order of values of a key."""
@@ -351,45 +556,14 @@ class YarpDB(object):
 		last_written_timestamp = str(key.key_node.get_last_written_timestamp())
 		access_bits = key.access_bits()
 
-		try:
-			parent_key = key.parent()
-		except Registry.RegistryException:
-			if (not self._is_hive_truncated) and (not is_deleted):
-				raise
-
-			parent_key_id = None
-		else:
-			if parent_key is not None:
-				parent_key_offset = parent_key.cell_relative_offset + RegistryFile.BASE_BLOCK_LENGTH_PRIMARY
-				if ((not self._is_hive_truncated) and parent_key_offset in self._hive.registry_file.cell_map_referenced) or \
-					(self._is_hive_truncated and parent_key_offset in self._hive.registry_file.cell_map_allocated):
-					parent_key_status = 0
-				else:
-					parent_key_status = 1
-
-				invalid_parent_key = False
-				if parent_key_status: # Validate a deleted parent key.
-					try:
-						RegistryRecover.ValidateKey(parent_key)
-					except (Registry.RegistryException, UnicodeDecodeError, ValueError, OverflowError):
-						invalid_parent_key = True
-
-				if not invalid_parent_key:
-					parent_key_id = self._db_key_to_id(parent_key, parent_key_status)
-				else:
-					parent_key_id = None
-
-				if parent_key_id is not None and parent_key_id == key_id: # Invalid parent key.
-					parent_key_id = None
+		parent_key_id, is_root = self._db_resolve_parent(key, is_deleted)
+		if is_root:
+			if not self._root_found:
+				self._root_found = True
+				self.db_cursor.execute('UPDATE `hive` SET `root_key_id` = ? WHERE `id` = ?', (key_id, 0))
 			else:
-				# This is the root key.
-				parent_key_id = None
-				if not self._root_found:
-					self._root_found = True
-					self.db_cursor.execute('UPDATE `hive` SET `root_key_id` = ? WHERE `id` = ?', (key_id, 0))
-				else:
-					# Two or more keys are marked as root, do not trust them.
-					self.db_cursor.execute('UPDATE `hive` SET `root_key_id` = ? WHERE `id` = ?', (None, 0))
+				# Two or more keys are marked as root, do not trust them.
+				self.db_cursor.execute('UPDATE `hive` SET `root_key_id` = ? WHERE `id` = ?', (None, 0))
 
 		self.db_cursor.execute('INSERT OR IGNORE INTO `keys` (`id`, `is_deleted`, `name`, `classname`, `last_written_timestamp`, `access_bits`, `parent_key_id`, `security_rowid`) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
 			(key_id, is_deleted, name, classname, last_written_timestamp, access_bits, parent_key_id, security_rowid))

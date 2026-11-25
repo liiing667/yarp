@@ -123,6 +123,9 @@ hive_sqlite = path.join(HIVES_DIR, 'SqliteHive')
 hive_reallocvalue_sqlite = path.join(HIVES_DIR, 'ReallocValueHive')
 hive_reallocvaluedata_sqlite = path.join(HIVES_DIR, 'ReallocValueDataHive')
 hive_dupname_sqlite = path.join(HIVES_DIR, 'DupNameHive')
+hive_same_name_tree_sqlite = path.join(HIVES_DIR, 'SameNameTreeHive')
+hive_dup_deleted_sqlite = path.join(HIVES_DIR, 'DupDeletedHive')
+hive_same_name_diff_parent_sqlite = path.join(HIVES_DIR, 'SameNameDiffParentHive')
 hive_offreg_sqlite = path.join(HIVES_DIR, 'OffHive')
 
 hive_two_owners = path.join(HIVES_DIR, 'TwoOwnersHive')
@@ -2293,6 +2296,81 @@ def test_sqlite():
 
 		for subkey in h.subkeys_with_name(rowid, 'nosuchkey'):
 			assert False
+
+	# A key recovered from a deleted tree has the same name (and an identical key node image)
+	# as a live key: both records must be kept with their own source (live vs. deleted) and
+	# full path identity, no silent merging.
+	with RegistrySqlite.YarpDB(hive_same_name_tree_sqlite, ':memory:') as h:
+		assert h.info().recovered == 0
+		assert h.info().truncated == 0
+		assert h.info().rebuilt == 0
+
+		rowid = h.root_key().rowid
+
+		h.db_cursor.execute("SELECT `is_deleted`, COUNT(*) FROM `keys` WHERE `name` = 'ccc' GROUP BY `is_deleted`")
+		rows = h.db_cursor.fetchall()
+		assert sorted(rows) == [ (0, 1), (1, 1) ]
+
+		h.db_cursor.execute("SELECT COUNT(DISTINCT `id`) FROM `keys` WHERE `name` = 'ccc'")
+		assert h.db_cursor.fetchone()[0] == 2
+
+		i = 0
+		for subkey in h.subkeys_with_name(rowid, 'cCC'):
+			if i == 0:
+				assert not subkey.is_deleted
+				assert subkey.name == 'ccc'
+			elif i == 1:
+				assert subkey.is_deleted
+				assert subkey.name == 'ccc'
+
+			# Both records keep the same full path identity (the root key as the parent).
+			assert h.get_rowid(subkey.parent_key_id) == rowid
+
+			i += 1
+
+		assert i == 2
+
+	# Two independent physical records of an identical deleted key node (same source, same
+	# parent identity, same key node image, different free cells) must not collapse into one row.
+	with RegistrySqlite.YarpDB(hive_dup_deleted_sqlite, ':memory:') as h:
+		assert h.info().recovered == 0
+		assert h.info().truncated == 0
+		assert h.info().rebuilt == 0
+
+		with open(hive_dup_deleted_sqlite, 'rb') as f:
+			hive = Registry.RegistryHive(f)
+			hive.walk_everywhere()
+			scanner_count = 0
+			for item in RegistryRecover.Scanner(hive).scan():
+				if type(item) is Registry.RegistryKey and item.name() == 'ccc':
+					scanner_count += 1
+
+		assert scanner_count == 2
+
+		h.db_cursor.execute("SELECT COUNT(*) FROM `keys` WHERE `name` = 'ccc' AND `is_deleted` = 1")
+		assert h.db_cursor.fetchone()[0] == 2
+
+		h.db_cursor.execute("SELECT COUNT(DISTINCT `id`) FROM `keys` WHERE `name` = 'ccc' AND `is_deleted` = 1")
+		assert h.db_cursor.fetchone()[0] == 2
+
+	# Same-named keys under different parent keys are legitimate and must stay distinct.
+	with RegistrySqlite.YarpDB(hive_same_name_diff_parent_sqlite, ':memory:') as h:
+		assert h.info().recovered == 0
+		assert h.info().truncated == 0
+		assert h.info().rebuilt == 0
+
+		h.db_cursor.execute("SELECT COUNT(*) FROM `keys` WHERE `name` = 'X'")
+		assert h.db_cursor.fetchone()[0] == 2
+
+		h.db_cursor.execute("SELECT COUNT(DISTINCT `id`) FROM `keys` WHERE `name` = 'X'")
+		assert h.db_cursor.fetchone()[0] == 2
+
+		parent_names = set()
+		h.db_cursor.execute("SELECT p.`name` FROM `keys` k JOIN `keys` p ON k.`parent_key_id` = p.`id` WHERE k.`name` = 'X'")
+		for row in h.db_cursor.fetchall():
+			parent_names.add(row[0])
+
+		assert parent_names == set([ 'A1', 'A2' ])
 
 def test_translator():
 	with open(truncated_hbin, 'rb') as src_obj:
